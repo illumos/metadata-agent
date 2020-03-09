@@ -9,7 +9,7 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-use netaddr2::NetAddr;
+use std::net::Ipv4Addr;
 
 
 const MOUNTPOINT: &str = "/var/metadata";
@@ -106,9 +106,28 @@ struct IPv4 {
 }
 
 impl IPv4 {
-    fn addr(&self) -> NetAddr {
-        NetAddr::V4(netaddr2::Netv4Addr::new(
-            self.ip_address.parse().unwrap(), self.netmask.parse().unwrap()))
+    fn prefix_len(&self) -> Result<u32> {
+        let nm: Ipv4Addr = self.netmask.parse()?;
+        let bits: u32 = nm.into();
+
+        if bits.leading_zeros() != 0 {
+            return Err(format!("bits not left packed in {}",
+                self.netmask).into());
+        }
+
+        let len = bits.count_ones();
+        if bits.trailing_zeros() != 32 - len {
+            return Err(format!("bits not contiguous in {}",
+                self.netmask).into());
+        }
+        assert_eq!(32 - len, bits.trailing_zeros());
+
+        Ok(len)
+    }
+
+    fn cidr(&self) -> Result<String> {
+        let prefix_len = self.prefix_len()?;
+        Ok(format!("{}/{}", self.ip_address, prefix_len))
     }
 }
 
@@ -321,7 +340,7 @@ struct IpadmAddress {
     name: String,
     type_: String,
     state: String,
-    addr: NetAddr,
+    cidr: String,
 }
 
 fn persistent_gateways() -> Result<Vec<String>> {
@@ -369,8 +388,33 @@ fn ipadm_address_list() -> Result<Vec<IpadmAddress>> {
         name: ent[0].to_string(),
         type_: ent[1].to_string(),
         state: ent[2].to_string(),
-        addr: ent[3].parse().unwrap(),
+        cidr: ent[3].to_string(),
     }).collect())
+}
+
+fn mac_sanitise(input: &str) -> String {
+    let mac = input.split(':').fold(String::new(), |mut buf, octet| {
+        if buf.len() > 0 {
+            /*
+             * Put the separating colon back between octets:
+             */
+            buf.push(':');
+        }
+
+        assert!(octet.len() == 1 || octet.len() == 2);
+        if octet.len() < 2 {
+            /*
+             * Use a leading zero to pad any single-digit octets:
+             */
+            buf.push('0');
+        }
+        buf.push_str(&octet);
+
+        buf
+    });
+
+    assert_eq!(mac.len(), 17);
+    mac
 }
 
 fn mac_to_nic(mac: &str) -> Result<Option<String>> {
@@ -386,19 +430,18 @@ fn mac_to_nic(mac: &str) -> Result<Option<String>> {
         return Err(format!("dladm failed: {:?}", output.stderr).into());
     }
 
-    let mut nics: HashMap<&str, &str> = HashMap::new();
+    let mut nics: HashMap<String, &str> = HashMap::new();
 
     let ents = parse_net_adm(output.stdout)?;
     for ent in ents.iter() {
-         if nics.contains_key(ent[1].as_str()) {
-             return Err(format!("MAC {} appeared on two NICs", ent[1]).into());
-         }
-         nics.insert(&ent[1], &ent[0]);
-    }
+        let mac = mac_sanitise(&ent[1]);
+        println!("MAC: {}", &mac);
 
-    /*
-     * XXX Rewrite "mac" parameter to remove leading zeroes (SIGH)
-     */
+        if nics.contains_key(mac.as_str()) {
+            return Err(format!("MAC {} appeared on two NICs", &mac).into());
+        }
+        nics.insert(mac, &ent[0]);
+    }
 
     if let Some(name) = nics.get(mac) {
         Ok(Some(name.to_string()))
@@ -513,8 +556,57 @@ fn main() -> Result<()> {
     }
 
     /*
-     * XXX Write /etc/hosts file with new nodename...
+     * Write /etc/hosts file with new nodename...
      */
+    let hosts = read_lines("/etc/inet/hosts")?.unwrap();
+    let hostsout: Vec<String> = hosts.iter().map(|l| {
+        /*
+         * Split the line into a substantive portion and an optional comment.
+         */
+        let sect: Vec<&str> = l.splitn(2, '#').collect();
+
+        let mut fore = sect[0].to_string();
+
+        if sect[0].trim().len() > 0 {
+            /*
+             * If the line has a substantive portion, split that into an IP
+             * address and a set of host names:
+             */
+            let portions: Vec<&str> = sect[0]
+                .splitn(2, |c| c == ' ' || c == '\t')
+                .collect();
+
+            if portions.len() > 1 {
+                /*
+                 * Rewrite only the localhost entry, to include the system node
+                 * name.  This essentially matches the OmniOS out-of-box file
+                 * contents.
+                 */
+                if portions[0] == "127.0.0.1" || portions[0] == "::1" {
+                    let mut hosts = String::new();
+                    hosts.push_str(portions[0]);
+                    if portions[0] == "::1" {
+                        hosts.push('\t');
+                    }
+                    hosts.push_str("\tlocalhost");
+                    if portions[0] == "127.0.0.1" {
+                        hosts.push_str(" loghost");
+                    }
+                    hosts.push_str(&format!(" {}.local {}",
+                        &md.hostname, &md.hostname));
+
+                    fore = hosts;
+                }
+            }
+        }
+
+        if sect.len() > 1 {
+            format!("{}#{}", fore, sect[1])
+        } else {
+            format!("{}", fore)
+        }
+    }).collect();
+    write_lines("/etc/inet/hosts", &hostsout)?;
 
     /*
      * Check network configuration:
@@ -531,9 +623,6 @@ fn main() -> Result<()> {
         if iface.type_ != "public" {
             continue;
         }
-
-        let a = iface.ipv4.addr();
-        println!("a: {}", a.to_string());
 
         println!("  find mac {}", iface.mac);
         let n = match mac_to_nic(&iface.mac)? {
@@ -562,10 +651,13 @@ fn main() -> Result<()> {
             }
         }
 
+        let targ = iface.ipv4.cidr()?;
+        println!("target IP: {}", targ);
+
         let mut found = false;
         // let mut anchor_found = false;
         for addr in &addrs {
-            if addr.addr == iface.ipv4.addr() {
+            if addr.cidr == targ {
                 println!("    ipadm address exists: {:?}", addr);
                 found = true;
             }
@@ -575,20 +667,18 @@ fn main() -> Result<()> {
             // }
         }
         if !found {
-            let a = iface.ipv4.addr().to_string();
-
-            println!("    ipadm address {} NEEDS CREATION", &a);
+            println!("    ipadm address {} NEEDS CREATION", &targ);
             let output = Command::new("/usr/sbin/ipadm")
                 .env_clear()
                 .arg("create-addr")
                 .arg("-T").arg("static")
-                .arg("-a").arg(&a)
+                .arg("-a").arg(&targ)
                 .arg(format!("{}/v4", n))
                 .output()?;
 
             if !output.status.success() {
                 let err = String::from_utf8_lossy(&output.stderr);
-                println!("ERROR: ipadm create-addr {} {}: {}", &a, n, err);
+                println!("ERROR: ipadm create-addr {} {}: {}", &targ, n, err);
                 continue;
             }
         }
@@ -596,7 +686,7 @@ fn main() -> Result<()> {
         //     println!("    ipadm anchor address NEEDS CREATION");
         //     continue;
         // }
-        
+
         if !gws.contains(&iface.ipv4.gateway) {
             println!("ADD GATEWAY {}", &iface.ipv4.gateway);
             let output = Command::new("/usr/sbin/route")
@@ -666,7 +756,7 @@ fn main() -> Result<()> {
     } else {
         Vec::new()
     };
-    println!("existing: {:#?}", &lines);
+    println!("existing: {:#?}", &file);
 
     let mut dirty = false;
     for key in &md.public_keys {

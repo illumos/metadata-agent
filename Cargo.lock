@@ -10,16 +10,9 @@ checksum = "b8b7a7c0c47db5545ed3fef7468ee7bb5b74691498139e4b3f6a20685dc6dd8e"
 name = "metadata"
 version = "0.1.0"
 dependencies = [
- "netaddr2",
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "netaddr2"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bfe3392f74f5490f68425564210456fedd710252ae7b6483e63c4c1a819ce4a"
 
 [[package]]
 name = "proc-macro2"
