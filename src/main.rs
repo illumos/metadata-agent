@@ -11,6 +11,8 @@ use serde::Deserialize;
 
 use std::net::Ipv4Addr;
 
+mod zpool;
+
 
 const MOUNTPOINT: &str = "/var/metadata";
 
@@ -450,7 +452,144 @@ fn mac_to_nic(mac: &str) -> Result<Option<String>> {
     }
 }
 
+fn memsize() -> Result<u64> {
+    let output = std::process::Command::new("/usr/sbin/prtconf")
+        .env_clear()
+        .arg("-m")
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!("ipadm failed: {:?}", output.stderr).into());
+    }
+
+    Ok(String::from_utf8(output.stdout)?.trim().parse()?)
+}
+
+fn create_zvol(name: &str, size_mib: u64) -> Result<()> {
+    let output = std::process::Command::new("/usr/sbin/zfs")
+        .env_clear()
+        .arg("create")
+        .arg("-V").arg(format!("{}m", size_mib))
+        .arg(name)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!("zfs create failed: {:?}", output.stderr).into());
+    }
+
+    Ok(())
+}
+
+fn exists_zvol(name: &str) -> Result<bool> {
+    let output = std::process::Command::new("/usr/sbin/zfs")
+        .env_clear()
+        .arg("list")
+        .arg("-Hp")
+        .arg("-o").arg("name,type")
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!("zfs list failed: {:?}", output.stderr).into());
+    }
+
+    let out = String::from_utf8(output.stdout)?;
+    for l in out.lines() {
+        let t: Vec<_> = l.split('\t').collect();
+        assert_eq!(t.len(), 2);
+
+        if t[0] != name {
+            continue;
+        }
+
+        if t[1] != "volume" {
+            return Err(format!("dataset {} was of type {}, not volume",
+                name, t[1]).into());
+        }
+
+        return Ok(true);
+    }
+
+    return Ok(false);
+}
+
+fn swapadd() -> Result<()> {
+    let output = std::process::Command::new("/sbin/swapadd")
+        .env_clear()
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!("swapadd failed: {:?}", output.stderr).into());
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    /*
+     * First, expand the ZFS pool.  We can do this prior to metadata access.
+     *
+     * NOTE: Though it might seem like we could skip directly to using "zpool
+     * online -e ...", there appears to be at least one serious deadlock in this
+     * code path.  The relabel operation appears to make the device briefly
+     * unavailable at exactly the moment zpool(1M) then tries to reopen it,
+     * which permanently corks access to the pool and hangs the machine.
+     * Instead, we go the long way around and use format(1M) and fmthard(1M) to
+     * effect our own expansion of the GPT and the slice first, so that
+     * zpool(1M) can skip straight to reopening the device.
+     */
+    let disk = zpool::zpool_disk()?;
+    println!("rpool disk: {}", disk);
+
+    if zpool::should_expand(&disk)? {
+        println!("expanding GPT...");
+        zpool::format_expand(&disk)?;
+        println!("    ok");
+    }
+
+    zpool::grow_data_partition(&disk)?;
+
+    println!("expanding zpool...");
+    zpool::zpool_expand("rpool", &disk)?;
+    println!("    ok");
+
+    /*
+     * Next, add a swap device.
+     */
+    let swapdev = "/dev/zvol/dsk/rpool/swap";
+    let swapsize = memsize()? * 2;
+    if !exists_zvol("rpool/swap")? {
+        println!("create swap zvol...");
+        create_zvol("rpool/swap", swapsize)?;
+    } else {
+        println!("swap zvol exists");
+    }
+
+    let mut vfstab = read_lines("/etc/vfstab")?.unwrap();
+    let mut found = false;
+    for l in &vfstab {
+        let t: Vec<_> = l.trim().split_whitespace().collect();
+        if t.len() < 7 {
+            continue;
+        }
+
+        if t[0] == swapdev {
+            found = true;
+        }
+    }
+    if !found {
+        println!("adding swap to vfstab");
+        vfstab.push("".into());
+        vfstab.push(format!("{}\t-\t-\tswap\t-\tno\t-", swapdev));
+        write_lines("/etc/vfstab", &vfstab)?;
+
+        swapadd()?;
+    } else {
+        println!("swap already configured in vfstab");
+    }
+
+    /*
+     * Check to see if the Metadata ISO is mounted already:
+     */
     let mounts = mounts()?;
     let mdmp: Vec<_> = mounts.iter()
         .filter(|m| { m.mount_point == MOUNTPOINT }).collect();
