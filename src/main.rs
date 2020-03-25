@@ -135,7 +135,7 @@ impl IPv4 {
 
 #[derive(Debug,Deserialize)]
 struct Interface {
-    anchor_ipv4: IPv4,
+    anchor_ipv4: Option<IPv4>,
     ipv4: IPv4,
     mac: String,
     #[serde(rename = "type")]
@@ -145,6 +145,7 @@ struct Interface {
 #[derive(Debug,Deserialize)]
 struct Interfaces {
     public: Vec<Interface>,
+    private: Vec<Interface>,
 }
 
 #[derive(Debug,Deserialize)]
@@ -524,6 +525,105 @@ fn swapadd() -> Result<()> {
     Ok(())
 }
 
+fn ensure_ipadm_interface(n: &str) -> Result<bool> {
+    println!("    ENSURE INTERFACE: {}", n);
+
+    let ifaces = ipadm_interface_list()?;
+    println!(" * INTERFACES: {:?}", &ifaces);
+
+    if ifaces.contains(&n.to_string()) {
+        println!("        interface {} exists", n);
+        Ok(false)
+    } else {
+        println!("        interface {} NEEDS CREATION", n);
+        let output = Command::new("/usr/sbin/ipadm")
+            .env_clear()
+            .arg("create-if")
+            .arg(n)
+            .output()?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            Err(format!("ERROR: ipadm create-if {}: {}", &n, err).into())
+        } else {
+            Ok(true)
+        }
+    }
+}
+
+fn ensure_ipv4_interface(sfx: &str, mac: &str, ipv4: &IPv4, use_gw: bool)
+    -> Result<()>
+{
+    println!("    ENSURE IPv4 INTERFACE: {}, {:?}, {}", mac, ipv4, use_gw);
+
+    println!("    find mac {}", mac);
+    let n = match mac_to_nic(mac)? {
+        None => {
+            eprintln!("MAC {} not found", mac);
+            std::process::exit(5);
+        }
+        Some(n) => n,
+    };
+    println!("        --> {:?}", n);
+
+    ensure_ipadm_interface(&n)?;
+
+    let targ = ipv4.cidr()?;
+    println!("    target IP: {}", targ);
+
+    let addrs = ipadm_address_list()?;
+    println!(" * ADDRESSES: {:?}", &addrs);
+
+    let mut found = false;
+    for addr in &addrs {
+        if addr.cidr == targ {
+            println!("    ipadm address exists: {:?}", addr);
+            found = true;
+        }
+    }
+
+    if !found {
+        println!("    ipadm address {} NEEDS CREATION", &targ);
+        let output = Command::new("/usr/sbin/ipadm")
+            .env_clear()
+            .arg("create-addr")
+            .arg("-T").arg("static")
+            .arg("-a").arg(&targ)
+            .arg(format!("{}/{}", n, sfx))
+            .output()?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("ipadm create-addr {} {}: {}", &targ,
+                n, err).into());
+        }
+    }
+
+    if use_gw {
+        let gws = persistent_gateways()?;
+        println!(" * GATEWAYS: {:?}", &gws);
+
+        if !gws.contains(&ipv4.gateway) {
+            println!("    ADD GATEWAY {}", &ipv4.gateway);
+            let output = Command::new("/usr/sbin/route")
+                .env_clear()
+                .arg("-p")
+                .arg("add")
+                .arg("default")
+                .arg(&ipv4.gateway)
+                .output()?;
+
+            if !output.status.success() {
+                let err = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("route add: {}", err).into());
+            }
+        }
+    }
+
+    println!("    ok, interface {}  address {} ({}) complete", n, targ, sfx);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     /*
      * First, expand the ZFS pool.  We can do this prior to metadata access.
@@ -750,96 +850,42 @@ fn main() -> Result<()> {
     /*
      * Check network configuration:
      */
-    let ifaces = ipadm_interface_list()?;
-    let addrs = ipadm_address_list()?;
-    let gws = persistent_gateways()?;
+    for iface in &md.interfaces.private {
+        if iface.type_ != "private" {
+            continue;
+        }
 
-    println!("INTERFACES: {:#?}", &ifaces);
-    println!("ADDRESSES: {:#?}", &addrs);
-    println!("GATEWAYS: {:?}", &gws);
+        if let Err(e) = ensure_ipv4_interface("private", &iface.mac,
+            &iface.ipv4, false)
+        {
+            /*
+             * Report the error, but drive on in case we can complete other
+             * configuration and make the guest accessible anyway.
+             */
+            println!("PRIV IFACE ERROR: {}", e);
+        }
+    }
 
     for iface in &md.interfaces.public {
         if iface.type_ != "public" {
             continue;
         }
 
-        println!("  find mac {}", iface.mac);
-        let n = match mac_to_nic(&iface.mac)? {
-            None => {
-                eprintln!("MAC {} not found", iface.mac);
-                std::process::exit(5);
-            }
-            Some(n) => n,
-        };
-        println!("   --> {:?}", n);
-
-        if ifaces.contains(&n) {
-            println!("    ipadm interface exists");
-        } else {
-            println!("    ipadm interface NEEDS CREATION");
-            let output = Command::new("/usr/sbin/ipadm")
-                .env_clear()
-                .arg("create-if")
-                .arg(&n)
-                .output()?;
-
-            if !output.status.success() {
-                let err = String::from_utf8_lossy(&output.stderr);
-                println!("ERROR: ipadm create-if {}: {}", &n, err);
-                continue;
-            }
+        if let Err(e) = ensure_ipv4_interface("public", &iface.mac,
+            &iface.ipv4, true)
+        {
+            /*
+             * Report the error, but drive on in case we can complete other
+             * configuration and make the guest accessible anyway.
+             */
+            println!("PUB IFACE ERROR: {}", e);
         }
 
-        let targ = iface.ipv4.cidr()?;
-        println!("target IP: {}", targ);
-
-        let mut found = false;
-        // let mut anchor_found = false;
-        for addr in &addrs {
-            if addr.cidr == targ {
-                println!("    ipadm address exists: {:?}", addr);
-                found = true;
-            }
-            // if addr.addr == iface.anchor_ipv4.addr() {
-            //     println!("    ipadm anchor address exists: {:?}", addr);
-            //     anchor_found = true;
-            // }
-        }
-        if !found {
-            println!("    ipadm address {} NEEDS CREATION", &targ);
-            let output = Command::new("/usr/sbin/ipadm")
-                .env_clear()
-                .arg("create-addr")
-                .arg("-T").arg("static")
-                .arg("-a").arg(&targ)
-                .arg(format!("{}/v4", n))
-                .output()?;
-
-            if !output.status.success() {
-                let err = String::from_utf8_lossy(&output.stderr);
-                println!("ERROR: ipadm create-addr {} {}: {}", &targ, n, err);
-                continue;
-            }
-        }
-        // if !anchor_found {
-        //     println!("    ipadm anchor address NEEDS CREATION");
-        //     continue;
-        // }
-
-        if !gws.contains(&iface.ipv4.gateway) {
-            println!("ADD GATEWAY {}", &iface.ipv4.gateway);
-            let output = Command::new("/usr/sbin/route")
-                .env_clear()
-                .arg("-p")
-                .arg("add")
-                .arg("default")
-                .arg(&iface.ipv4.gateway)
-                .output()?;
-
-            if !output.status.success() {
-                let err = String::from_utf8_lossy(&output.stderr);
-                println!("ERROR: route add: {}", err);
-                continue;
+        if let Some(anchor) = &iface.anchor_ipv4 {
+            if let Err(e) = ensure_ipv4_interface("anchor", &iface.mac,
+                &anchor, false)
+            {
+                println!("ANCHOR IFACE ERROR: {}", e);
             }
         }
     }
