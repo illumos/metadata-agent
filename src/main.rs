@@ -18,6 +18,7 @@ use common::*;
 
 const MOUNTPOINT: &str = "/var/metadata";
 const STAMP: &str = "/var/adm/digitalocean.stamp";
+const DEFROUTER: &str = "/etc/defaultrouter";
 
 
 pub fn write_file(p: &str, data: &str) -> Result<()> {
@@ -351,33 +352,6 @@ struct IpadmAddress {
     cidr: String,
 }
 
-fn persistent_gateways() -> Result<Vec<String>> {
-    let output = Command::new("/usr/sbin/route")
-        .env_clear()
-        .arg("-p")
-        .arg("show")
-        .output()?;
-
-    if !output.status.success() {
-        bail!("route failed: {:?}", output.stderr);
-    }
-
-    let stdout = String::from_utf8(output.stdout)?;
-    let mut out = Vec::new();
-
-    for l in stdout.lines() {
-        let terms: Vec<&str> = l.split(' ').collect();
-        match terms.as_slice() {
-            ["persistent:", "route", "add", "default", gw] => {
-                out.push(gw.to_string());
-            }
-            _ => continue,
-        };
-    }
-
-    Ok(out)
-}
-
 fn ipadm_address_list() -> Result<Vec<IpadmAddress>> {
     let output = Command::new("/usr/sbin/ipadm")
         .env_clear()
@@ -596,14 +570,23 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &IPv4,
     }
 
     if use_gw {
-        let gws = persistent_gateways()?;
-        println!(" * GATEWAYS: {:?}", &gws);
+        let mut defrouters = read_lines_maybe(DEFROUTER)?;
+        let mut dirty = false;
+        info!(log, "existing default routers: {:?}", &defrouters);
 
-        if !gws.contains(&ipv4.gateway) {
-            println!("    ADD GATEWAY {}", &ipv4.gateway);
+        if !defrouters.contains(&ipv4.gateway) {
+            info!(log, "    ADD GATEWAY {}", &ipv4.gateway);
+            defrouters.insert(0, ipv4.gateway.clone());
+            dirty = true;
+
+            /*
+             * This attempts to add the default route to the live system.  It
+             * may fail (e.g., if the route already exists) but we should just
+             * report and ignore such a failure as long as we are able to write
+             * the config file.
+             */
             let output = Command::new("/usr/sbin/route")
                 .env_clear()
-                .arg("-p")
                 .arg("add")
                 .arg("default")
                 .arg(&ipv4.gateway)
@@ -612,6 +595,10 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &IPv4,
             if !output.status.success() {
                 warn!(log, "route add failure: {}", output.info());
             }
+        }
+
+        if dirty {
+            write_lines(log, DEFROUTER, defrouters.as_slice())?;
         }
     }
 
