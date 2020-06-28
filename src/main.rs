@@ -12,11 +12,12 @@ use serde::Deserialize;
 use std::net::Ipv4Addr;
 
 mod zpool;
+mod common;
+use common::*;
 
 
 const MOUNTPOINT: &str = "/var/metadata";
-
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+const STAMP: &str = "/var/adm/digitalocean.stamp";
 
 
 pub fn write_file(p: &str, data: &str) -> Result<()> {
@@ -49,7 +50,7 @@ fn read_file(p: &str) -> Result<Option<String>> {
         Err(e) => {
             match e.kind() {
                 std::io::ErrorKind::NotFound => return Ok(None),
-                _ => return Err(format!("open \"{}\": {}", p, e).into()),
+                _ => bail!("open \"{}\": {}", p, e),
             };
         }
     };
@@ -63,6 +64,13 @@ fn read_lines(p: &str) -> Result<Option<Vec<String>>> {
     Ok(read_file(p)?.map_or(None, |data| {
         Some(data.lines().map(|a| a.trim().to_string()).collect())
     }))
+}
+
+fn read_lines_maybe(p: &str) -> Result<Vec<String>> {
+    Ok(match read_lines(p)? {
+        None => Vec::new(),
+        Some(l) => l,
+    })
 }
 
 fn read_json<T>(p: &str) -> Result<Option<T>>
@@ -113,14 +121,12 @@ impl IPv4 {
         let bits: u32 = nm.into();
 
         if bits.leading_zeros() != 0 {
-            return Err(format!("bits not left packed in {}",
-                self.netmask).into());
+            bail!("bits not left packed in {}", self.netmask);
         }
 
         let len = bits.count_ones();
         if bits.trailing_zeros() != 32 - len {
-            return Err(format!("bits not contiguous in {}",
-                self.netmask).into());
+            bail!("bits not contiguous in {}", self.netmask);
         }
         assert_eq!(32 - len, bits.trailing_zeros());
 
@@ -207,15 +213,15 @@ fn exists_dir(p: &str) -> Result<bool> {
         Ok(md) => md,
         Err(e) => match e.kind() {
             ErrorKind::NotFound => return Ok(false),
-            _ => return Err(e.into()),
+            _ => bail!("checking {}: {}", p, e),
         },
     };
 
-    if md.is_dir() {
-        Ok(true)
-    } else {
-        Err(format!("\"{}\" exists but is not a directory", p).into())
+    if !md.is_dir() {
+        bail!("\"{}\" exists but is not a directory", p);
     }
+
+    Ok(true)
 }
 
 fn find_device() -> Result<Option<String>> {
@@ -256,7 +262,7 @@ fn find_device() -> Result<Option<String>> {
     match out.len() {
         0 => Ok(None),
         1 => Ok(Some(out[0].to_str().unwrap().to_string())),
-        n => Err(format!("found {} hsfs file systems", n).into()),
+        n => bail!("found {} hsfs file systems", n),
     }
 }
 
@@ -330,7 +336,7 @@ fn ipadm_interface_list() -> Result<Vec<String>> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("ipadm failed: {:?}", output.stderr).into());
+        bail!("ipadm failed: {:?}", output.stderr);
     }
 
     let ents = parse_net_adm(output.stdout)?;
@@ -354,7 +360,7 @@ fn persistent_gateways() -> Result<Vec<String>> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("route failed: {:?}", output.stderr).into());
+        bail!("route failed: {:?}", output.stderr);
     }
 
     let stdout = String::from_utf8(output.stdout)?;
@@ -382,7 +388,7 @@ fn ipadm_address_list() -> Result<Vec<IpadmAddress>> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("ipadm failed: {:?}", output.stderr).into());
+        bail!("ipadm failed: {:?}", output.stderr);
     }
 
     let ents = parse_net_adm(output.stdout)?;
@@ -430,7 +436,7 @@ fn mac_to_nic(mac: &str) -> Result<Option<String>> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("dladm failed: {:?}", output.stderr).into());
+        bail!("dladm failed: {:?}", output.stderr);
     }
 
     let mut nics: HashMap<String, &str> = HashMap::new();
@@ -441,7 +447,7 @@ fn mac_to_nic(mac: &str) -> Result<Option<String>> {
         println!("MAC: {}", &mac);
 
         if nics.contains_key(mac.as_str()) {
-            return Err(format!("MAC {} appeared on two NICs", &mac).into());
+            bail!("MAC {} appeared on two NICs", &mac);
         }
         nics.insert(mac, &ent[0]);
     }
@@ -460,7 +466,7 @@ fn memsize() -> Result<u64> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("ipadm failed: {:?}", output.stderr).into());
+        bail!("ipadm failed: {:?}", output.stderr);
     }
 
     Ok(String::from_utf8(output.stdout)?.trim().parse()?)
@@ -475,7 +481,7 @@ fn create_zvol(name: &str, size_mib: u64) -> Result<()> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("zfs create failed: {:?}", output.stderr).into());
+        bail!("zfs create failed: {:?}", output.stderr);
     }
 
     Ok(())
@@ -490,7 +496,7 @@ fn exists_zvol(name: &str) -> Result<bool> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("zfs list failed: {:?}", output.stderr).into());
+        bail!("zfs list failed: {:?}", output.stderr);
     }
 
     let out = String::from_utf8(output.stdout)?;
@@ -503,8 +509,7 @@ fn exists_zvol(name: &str) -> Result<bool> {
         }
 
         if t[1] != "volume" {
-            return Err(format!("dataset {} was of type {}, not volume",
-                name, t[1]).into());
+            bail!("dataset {} was of type {}, not volume", name, t[1]);
         }
 
         return Ok(true);
@@ -519,7 +524,7 @@ fn swapadd() -> Result<()> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("swapadd failed: {:?}", output.stderr).into());
+        bail!("swapadd failed: {:?}", output.stderr);
     }
 
     Ok(())
@@ -544,10 +549,10 @@ fn ensure_ipadm_interface(n: &str) -> Result<bool> {
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
-            Err(format!("ERROR: ipadm create-if {}: {}", &n, err).into())
-        } else {
-            Ok(true)
+            bail!("ERROR: ipadm create-if {}: {}", &n, err);
         }
+
+        Ok(true)
     }
 }
 
@@ -594,8 +599,7 @@ fn ensure_ipv4_interface(sfx: &str, mac: &str, ipv4: &IPv4, use_gw: bool)
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("ipadm create-addr {} {}: {}", &targ,
-                n, err).into());
+            bail!("ipadm create-addr {} {}: {}", &targ, n, err);
         }
     }
 
@@ -615,7 +619,7 @@ fn ensure_ipv4_interface(sfx: &str, mac: &str, ipv4: &IPv4, use_gw: bool)
 
             if !output.status.success() {
                 let err = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("route add: {}", err).into());
+                bail!("route add: {}", err);
             }
         }
     }
@@ -624,7 +628,121 @@ fn ensure_ipv4_interface(sfx: &str, mac: &str, ipv4: &IPv4, use_gw: bool)
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() {
+    let log = init_log();
+
+    match run(&log) {
+        Ok(()) => {
+            info!(log, "ok, run complete");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            error!(log, "fatal error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run(log: &Logger) -> Result<()> {
+    /*
+     * This program could be destructive if run in the wrong place.  Try to
+     * ensure it has at least been installed as an SMF service:
+     */
+    if let Some(fmri) = std::env::var_os("SMF_FMRI") {
+        info!(log, "SMF instance: {}", fmri.to_string_lossy());
+    } else {
+        bail!("SMF_FMRI is not set; running under SMF?");
+    }
+
+    /*
+     * First, locate and mount the metadata ISO.  We need to load the droplet ID
+     * so that we can determine if we have completed first boot processing for
+     * this droplet or not.
+     */
+    let mounts = mounts()?;
+    let mdmp: Vec<_> = mounts.iter()
+        .filter(|m| { m.mount_point == MOUNTPOINT }).collect();
+
+    let do_mount = match mdmp.as_slice() {
+        [] => true,
+        [m] => {
+            /*
+             * Check the existing mount to see if it is adequate.
+             */
+            if m.fstype != "hsfs" {
+                bail!("INVALID MOUNTED FILE SYSTEM: {:#?}", m);
+            }
+            false
+        }
+        m => {
+            bail!("found these mounts for {}: {:#?}", MOUNTPOINT, m);
+        }
+    };
+
+    if do_mount {
+        info!(log, "need to mount Metadata ISO");
+
+        if !exists_dir(MOUNTPOINT)? {
+            info!(log, "should do mkdir");
+            DirBuilder::new()
+                .mode(0o700)
+                .create(MOUNTPOINT)?;
+        }
+
+        let dev = if let Some(dev) = find_device()? {
+            dev
+        } else {
+            bail!("no hsfs file system found");
+        };
+
+        let output = Command::new("/usr/sbin/mount")
+            .env_clear()
+            .arg("-F").arg("hsfs")
+            .arg(dev)
+            .arg(MOUNTPOINT)
+            .output()?;
+
+        if !output.status.success() {
+            bail!("mount: {:?}", output.stderr);
+        }
+
+        info!(log, "mount ok at {}", MOUNTPOINT);
+    }
+
+    /*
+     * Read metadata from the file system:
+     */
+    let md: Option<Metadata> = read_json(
+        &format!("{}/digitalocean_meta_data.json", MOUNTPOINT))?;
+
+    let md = if let Some(md) = md {
+        md
+    } else {
+        bail!("could not read metadata file");
+    };
+
+    info!(log, "metadata: {:#?}", md);
+
+    /*
+     * Load our stamp file to see if the Droplet ID has changed.
+     */
+    let sl = read_lines(STAMP)?;
+    match sl.as_ref().map(|s| s.as_slice()) {
+        Some([id]) => {
+            let expected = md.droplet_id.to_string();
+
+            if id.trim() == expected {
+                info!(log, "this droplet has already completed first \
+                    boot processing, halting");
+                return Ok(());
+            } else {
+                info!(log, "droplet ID changed ({} -> {}), reprocessing",
+                    id.trim(), expected);
+            }
+        }
+        _ => (),
+    }
+
     /*
      * First, expand the ZFS pool.  We can do this prior to metadata access.
      *
@@ -638,19 +756,19 @@ fn main() -> Result<()> {
      * zpool(1M) can skip straight to reopening the device.
      */
     let disk = zpool::zpool_disk()?;
-    println!("rpool disk: {}", disk);
+    info!(log, "rpool disk: {}", disk);
 
     if zpool::should_expand(&disk)? {
-        println!("expanding GPT...");
-        zpool::format_expand(&disk)?;
-        println!("    ok");
+        info!(log, "expanding GPT...");
+        zpool::format_expand(log, &disk)?;
+        info!(log, "GPT expansion ok");
     }
 
-    zpool::grow_data_partition(&disk)?;
+    zpool::grow_data_partition(log, &disk)?;
 
-    println!("expanding zpool...");
+    info!(log, "expanding zpool...");
     zpool::zpool_expand("rpool", &disk)?;
-    println!("    ok");
+    info!(log, "zpool expansion ok");
 
     /*
      * Next, add a swap device.
@@ -658,10 +776,10 @@ fn main() -> Result<()> {
     let swapdev = "/dev/zvol/dsk/rpool/swap";
     let swapsize = memsize()? * 2;
     if !exists_zvol("rpool/swap")? {
-        println!("create swap zvol...");
+        info!(log, "create swap zvol...");
         create_zvol("rpool/swap", swapsize)?;
     } else {
-        println!("swap zvol exists");
+        info!(log, "swap zvol exists");
     }
 
     let mut vfstab = read_lines("/etc/vfstab")?.unwrap();
@@ -677,91 +795,15 @@ fn main() -> Result<()> {
         }
     }
     if !found {
-        println!("adding swap to vfstab");
+        info!(log, "adding swap to vfstab");
         vfstab.push("".into());
         vfstab.push(format!("{}\t-\t-\tswap\t-\tno\t-", swapdev));
         write_lines("/etc/vfstab", &vfstab)?;
 
         swapadd()?;
     } else {
-        println!("swap already configured in vfstab");
+        info!(log, "swap already configured in vfstab");
     }
-
-    /*
-     * Check to see if the Metadata ISO is mounted already:
-     */
-    let mounts = mounts()?;
-    let mdmp: Vec<_> = mounts.iter()
-        .filter(|m| { m.mount_point == MOUNTPOINT }).collect();
-
-    let do_mount = match mdmp.len() {
-        0 => true,
-        1 => {
-            /*
-             * Check the existing mount to see if it is adequate.
-             */
-            let m = &mdmp[0];
-            if m.fstype != "hsfs" {
-                eprintln!("INVALID MOUNTED FILE SYSTEM: {:#?}", m);
-                std::process::exit(10);
-            }
-            false
-        }
-        _ => {
-            eprintln!("ERROR: found {} mounts for {}", mdmp.len(),
-                MOUNTPOINT);
-            std::process::exit(1);
-        }
-    };
-
-    if do_mount {
-        println!("should do mount");
-
-        if !exists_dir(MOUNTPOINT)? {
-            println!("should do mkdir");
-            DirBuilder::new()
-                .mode(0o700)
-                .create(MOUNTPOINT)?;
-        }
-
-        let dev = match find_device()? {
-            Some(dev) => dev,
-            None => {
-                eprintln!("ERROR: no hsfs file system found");
-                std::process::exit(2);
-            }
-        };
-
-        let output = Command::new("/usr/sbin/mount")
-            .env_clear()
-            .arg("-F").arg("hsfs")
-            .arg(dev)
-            .arg(MOUNTPOINT)
-            .output()?;
-
-        if !output.status.success() {
-            eprintln!("ERROR: mount: {:?}", output.stderr);
-            std::process::exit(3);
-        }
-
-        println!("mount ok");
-    }
-
-    /*
-     * Read metadata from the file system:
-     */
-    let md: Option<Metadata> = read_json(
-        &format!("{}/digitalocean_meta_data.json", MOUNTPOINT))?;
-
-    let md = match md {
-        Some(md) => md,
-        None => {
-            eprintln!("ERROR: could not read metadata file");
-            std::process::exit(3);
-        }
-    };
-
-    println!("metadata: {:#?}", md);
 
     /*
      * Check nodename:
@@ -773,7 +815,7 @@ fn main() -> Result<()> {
     };
 
     if write_nodename {
-        println!("WRITE NODENAME \"{}\"", &md.hostname);
+        info!(log, "WRITE NODENAME \"{}\"", &md.hostname);
 
         let status = Command::new("/usr/bin/hostname")
             .env_clear()
@@ -781,7 +823,7 @@ fn main() -> Result<()> {
             .status()?;
 
         if !status.success() {
-            eprintln!("WARNING: could not set live system hostname");
+             error!(log, "could not set live system hostname");
         }
 
         /*
@@ -791,7 +833,7 @@ fn main() -> Result<()> {
         write_lines("/etc/nodename", &[ &md.hostname ])?;
 
     } else {
-        println!("NODENAME \"{}\" OK ALREADY", &md.hostname);
+        info!(log, "NODENAME \"{}\" OK ALREADY", &md.hostname);
     }
 
     /*
@@ -862,7 +904,7 @@ fn main() -> Result<()> {
              * Report the error, but drive on in case we can complete other
              * configuration and make the guest accessible anyway.
              */
-            println!("PRIV IFACE ERROR: {}", e);
+            error!(log, "PRIV IFACE ERROR: {}", e);
         }
     }
 
@@ -878,14 +920,14 @@ fn main() -> Result<()> {
              * Report the error, but drive on in case we can complete other
              * configuration and make the guest accessible anyway.
              */
-            println!("PUB IFACE ERROR: {}", e);
+            error!(log, "PUB IFACE ERROR: {}", e);
         }
 
         if let Some(anchor) = &iface.anchor_ipv4 {
             if let Err(e) = ensure_ipv4_interface("anchor", &iface.mac,
                 &anchor, false)
             {
-                println!("ANCHOR IFACE ERROR: {}", e);
+                error!(log, "ANCHOR IFACE ERROR: {}", e);
             }
         }
     }
@@ -893,13 +935,9 @@ fn main() -> Result<()> {
     /*
      * DNS Servers:
      */
-    println!("checking DNS configuration...");
-    let lines = if let Some(lines) = read_lines("/etc/resolv.conf")? {
-        lines
-    } else {
-        Vec::new()
-    };
-    println!("existing lines: {:#?}", &lines);
+    info!(log, "checking DNS configuration...");
+    let lines = read_lines_maybe("/etc/resolv.conf")?;
+    info!(log, "existing DNS config lines: {:#?}", &lines);
 
     let mut dirty = false;
     let mut file: Vec<String> = Vec::new();
@@ -907,7 +945,7 @@ fn main() -> Result<()> {
     for ns in &md.dns.nameservers {
         let l = format!("nameserver {}", ns);
         if !lines.contains(&l) {
-            println!("ADD LINE: {}", l);
+            info!(log, "ADD DNS CONFIG LINE: {}", l);
             file.push(l);
             dirty = true;
         }
@@ -918,7 +956,7 @@ fn main() -> Result<()> {
         if ll.len() == 2 && ll[0] == "nameserver" &&
             !md.dns.nameservers.contains(&ll[1].to_string())
         {
-            println!("REMOVE LINE: {}", l);
+            info!(log, "REMOVE DNS CONFIG LINE: {}", l);
             file.push(format!("#{}", l));
             dirty = true;
         } else {
@@ -933,20 +971,14 @@ fn main() -> Result<()> {
     /*
      * Manage the public keys:
      */
-    println!("checking public keys...");
-    let mut file = if let Some(lines) = read_lines(
-        "/root/.ssh/authorized_keys")?
-    {
-        lines
-    } else {
-        Vec::new()
-    };
-    println!("existing: {:#?}", &file);
+    info!(log, "checking SSH public keys...");
+    let mut file = read_lines_maybe("/root/.ssh/authorized_keys")?;
+    info!(log, "existing SSH public keys: {:#?}", &file);
 
     let mut dirty = false;
     for key in &md.public_keys {
         if !file.contains(key) {
-            println!("add key: {}", key);
+            info!(log, "add SSH public key: {}", key);
             file.push(key.to_string());
             dirty = true;
         }
@@ -955,6 +987,8 @@ fn main() -> Result<()> {
     if dirty {
         write_lines("/root/.ssh/authorized_keys", file.as_ref())?;
     }
+
+    write_lines(STAMP, &[md.droplet_id.to_string()])?;
 
     Ok(())
 }

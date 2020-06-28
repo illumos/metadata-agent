@@ -2,16 +2,25 @@
 use std::collections::HashMap;
 use std::io::Write;
 
+use super::common::*;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+trait OutputExt {
+    fn info(&self) -> String;
+}
 
-pub fn fmthard(disk: &str, part: &str, tag: &str, flag: &str, start: u64,
-    size: u64) -> Result<()>
+impl OutputExt for std::process::Output {
+    fn info(&self) -> String {
+        String::from_utf8_lossy(&self.stderr).trim().to_string()
+    }
+}
+
+pub fn fmthard(log: &Logger, disk: &str, part: &str, tag: &str, flag: &str,
+    start: u64, size: u64) -> Result<()>
 {
     let cmd = format!("{}:{}:{}:{}:{}", part, tag, flag, start, size);
     let path = format!("/dev/rdsk/{}p0", disk);
 
-    println!("fmthard -d {} {}", cmd, path);
+    info!(log, "exec: fmthard -d {} {}", cmd, path);
 
     let output = std::process::Command::new("/usr/sbin/fmthard")
         .env_clear()
@@ -20,8 +29,7 @@ pub fn fmthard(disk: &str, part: &str, tag: &str, flag: &str, start: u64,
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("fmthard failure: {}",
-            String::from_utf8_lossy(&output.stderr)).into());
+        bail!("fmthard failure: {}", output.info());
     }
 
     Ok(())
@@ -37,8 +45,7 @@ pub fn zpool_expand(pool: &str, disk: &str) -> Result<()> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("zpool online failure: {}",
-            String::from_utf8_lossy(&output.stderr)).into());
+        bail!("zpool online failure: {}", output.info());
     }
 
     Ok(())
@@ -54,16 +61,14 @@ pub fn zpool_disk() -> Result<String> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("zpool list failure: {}",
-            String::from_utf8_lossy(&output.stderr)).into());
+        bail!("zpool list failure: {}", output.info());
     }
 
     let out = String::from_utf8(output.stdout)?;
     let lines: Vec<_> = out.lines().collect();
 
     if lines.len() != 2 {
-        return Err(format!("zpool list unexpected results: {:?}",
-            lines).into());
+        bail!("zpool list unexpected results: {:?}", lines);
     }
 
     let terms: Vec<_> = lines.iter().map(|l| {
@@ -72,8 +77,7 @@ pub fn zpool_disk() -> Result<String> {
 
     if terms[0].len() < 1 || terms[0][0] != pool ||
         terms[1].len() < 2 || terms[1][0] != "" {
-        return Err(format!("zpool list unexpected results: {:?}",
-            terms).into());
+        bail!("zpool list unexpected results: {:?}", terms);
     }
 
     Ok(terms[1][1].to_string())
@@ -103,8 +107,7 @@ fn prtvtoc(disk: &str) -> Result<Vtoc> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("prtvtoc {} failure: {}", disk,
-            String::from_utf8_lossy(&output.stderr)).into());
+        bail!("prtvtoc {} failure: {}", disk, output.info());
     }
 
     let out = String::from_utf8(output.stdout)?;
@@ -157,8 +160,7 @@ fn prtvtoc(disk: &str) -> Result<Vtoc> {
     }
 
     if sectorcount.is_none() || sectorsize.is_none() {
-        return Err(format!("prtvtoc {} bad output: {:?}", disk,
-            lines).into());
+        bail!("prtvtoc {} bad output: {:?}", disk, lines);
     }
 
     Ok(Vtoc {
@@ -173,13 +175,13 @@ fn prtvtoc(disk: &str) -> Result<Vtoc> {
  * enlarged underlying volume.  This interface is clunky and unfortunate, but
  * I'm not currently aware of a better way.
  */
-pub fn format_expand(disk: &str) -> Result<()> {
+pub fn format_expand(log: &Logger, disk: &str) -> Result<()> {
     /*
      * We need a temporary file with a list of commands for format(1M) to
      * execute using the "-f" option.
      */
     let tf = tempfile::NamedTempFile::new()?;
-    println!("TEMP FILE: {:?}", tf.path().to_str().unwrap());
+    info!(log, "TEMP FILE: {:?}", tf.path().to_str().unwrap());
     let mut w = std::io::BufWriter::new(tf.as_file());
     w.write_all("partition\nexpand\nlabel\nquit\nquit\n".as_bytes())?;
     w.flush()?;
@@ -191,8 +193,7 @@ pub fn format_expand(disk: &str) -> Result<()> {
         .output()?;
 
     if !output.status.success() {
-        return Err(format!("format failure: {}",
-            String::from_utf8_lossy(&output.stderr)).into());
+        bail!("format failure: {}", output.info());
     }
 
     Ok(())
@@ -206,13 +207,12 @@ pub fn should_expand(disk: &str) -> Result<bool> {
     let vtoc = prtvtoc(&disk)?;
 
     if vtoc.sector_size != 512 {
-        return Err("only works with 512 byte sectors at the moment".into());
+        bail!("only works with 512 byte sectors at the moment");
     }
 
     let reserved = vtoc.partitions.get("8").unwrap();
     if reserved.tag != "11" || reserved.sector_count != 16384 {
-        return Err("slice 8 does not look like a regular reserved \
-            partition".into());
+        bail!("slice 8 does not look like a regular reserved partition");
     }
 
     /*
@@ -222,7 +222,7 @@ pub fn should_expand(disk: &str) -> Result<bool> {
     let expected_ls = vtoc.sector_count - 34;
 
     if expected_ls < reserved.sector_last {
-        return Err("cannot shrink partition".into());
+        bail!("cannot shrink partition");
     }
 
     Ok(expected_ls > reserved.sector_last)
@@ -231,39 +231,47 @@ pub fn should_expand(disk: &str) -> Result<bool> {
 /**
  * Check to see if the data slice should be grown to fill any unallocated space.
  */
-pub fn grow_data_partition(disk: &str) -> Result<()> {
+pub fn grow_data_partition(log: &Logger, disk: &str) -> Result<()> {
     let vtoc = prtvtoc(&disk)?;
 
     if vtoc.sector_size != 512 {
-        return Err("only works with 512 byte sectors at the moment".into());
+        bail!("only works with 512 byte sectors at the moment");
     }
 
     let reserved = vtoc.partitions.get("8").unwrap();
     if reserved.tag != "11" || reserved.sector_count != 16384 {
-        return Err("slice 8 does not look like a regular reserved \
-            partition".into());
+        bail!("slice 8 does not look like a regular reserved partition");
     }
 
-    let data = vtoc.partitions.get("1").unwrap();
+    /*
+     * Depending on the image, there may or may not be an EFI System Partition.
+     * If there is, it will be partition 0 which will mean the pool is partition
+     * 1.
+     */
+    let datapartname = match vtoc.partitions.len() {
+        2 => "0",
+        3 => "1",
+        n => bail!("found {} partitions, wanted 2 or 3", n),
+    };
+    let data = vtoc.partitions.get(datapartname).unwrap();
     if data.tag != "4" {
-        eprintln!("slice 1 does not look like a regular data partition");
-        std::process::exit(1);
+        bail!("slice 1 does not look like a regular data partition");
     }
 
     if data.sector_last >= reserved.sector_first - 1 {
         /*
          * The data partition is at least as large as expected, so do nothing.
          */
-        println!("data partition growth not required");
+        info!(log, "data partition growth not required");
         return Ok(());
     }
 
     let delta = reserved.sector_first - 1 - data.sector_last;
 
-    println!("growing data partition...");
-    fmthard(disk, &data.id, &data.tag, &data.flags,
+    info!(log, "growing data partition...");
+    fmthard(log, disk, &data.id, &data.tag, &data.flags,
         data.sector_first, data.sector_count + delta)?;
-    println!("    ok");
+    info!(log, "partition growth ok");
 
     Ok(())
 }
