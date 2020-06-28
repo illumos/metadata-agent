@@ -31,16 +31,15 @@ pub fn write_file(p: &str, data: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_lines<T: AsRef<str>>(p: &str, lines: &[T]) -> Result<()> {
+fn write_lines<L>(log: &Logger, p: &str, lines: &[L]) -> Result<()>
+    where L: AsRef<str> + std::fmt::Debug
+{
+    info!(log, "----- WRITE FILE: {} ------ {:#?}", p, lines);
     let mut out = String::new();
-    println!("----- WRITE FILE: {} ----------------------", p);
     for l in lines {
-        println!("| {}", l.as_ref());
         out.push_str(l.as_ref());
         out.push_str("\n");
     }
-    println!("--------------------------------");
-    println!("");
     write_file(p, &out)
 }
 
@@ -336,7 +335,7 @@ fn ipadm_interface_list() -> Result<Vec<String>> {
         .output()?;
 
     if !output.status.success() {
-        bail!("ipadm failed: {:?}", output.stderr);
+        bail!("ipadm failed: {}", output.info());
     }
 
     let ents = parse_net_adm(output.stdout)?;
@@ -388,7 +387,7 @@ fn ipadm_address_list() -> Result<Vec<IpadmAddress>> {
         .output()?;
 
     if !output.status.success() {
-        bail!("ipadm failed: {:?}", output.stderr);
+        bail!("ipadm failed: {}", output.info());
     }
 
     let ents = parse_net_adm(output.stdout)?;
@@ -436,7 +435,7 @@ fn mac_to_nic(mac: &str) -> Result<Option<String>> {
         .output()?;
 
     if !output.status.success() {
-        bail!("dladm failed: {:?}", output.stderr);
+        bail!("dladm failed: {}", output.info());
     }
 
     let mut nics: HashMap<String, &str> = HashMap::new();
@@ -444,7 +443,6 @@ fn mac_to_nic(mac: &str) -> Result<Option<String>> {
     let ents = parse_net_adm(output.stdout)?;
     for ent in ents.iter() {
         let mac = mac_sanitise(&ent[1]);
-        println!("MAC: {}", &mac);
 
         if nics.contains_key(mac.as_str()) {
             bail!("MAC {} appeared on two NICs", &mac);
@@ -466,7 +464,7 @@ fn memsize() -> Result<u64> {
         .output()?;
 
     if !output.status.success() {
-        bail!("ipadm failed: {:?}", output.stderr);
+        bail!("ipadm failed: {}", output.info());
     }
 
     Ok(String::from_utf8(output.stdout)?.trim().parse()?)
@@ -481,7 +479,7 @@ fn create_zvol(name: &str, size_mib: u64) -> Result<()> {
         .output()?;
 
     if !output.status.success() {
-        bail!("zfs create failed: {:?}", output.stderr);
+        bail!("zfs create failed: {}", output.info());
     }
 
     Ok(())
@@ -496,7 +494,7 @@ fn exists_zvol(name: &str) -> Result<bool> {
         .output()?;
 
     if !output.status.success() {
-        bail!("zfs list failed: {:?}", output.stderr);
+        bail!("zfs list failed: {}", output.info());
     }
 
     let out = String::from_utf8(output.stdout)?;
@@ -524,23 +522,23 @@ fn swapadd() -> Result<()> {
         .output()?;
 
     if !output.status.success() {
-        bail!("swapadd failed: {:?}", output.stderr);
+        bail!("swapadd failed: {}", output.info());
     }
 
     Ok(())
 }
 
-fn ensure_ipadm_interface(n: &str) -> Result<bool> {
-    println!("    ENSURE INTERFACE: {}", n);
+fn ensure_ipadm_interface(log: &Logger, n: &str) -> Result<bool> {
+    info!(log, "ENSURE INTERFACE: {}", n);
 
     let ifaces = ipadm_interface_list()?;
-    println!(" * INTERFACES: {:?}", &ifaces);
+    info!(log, "INTERFACES: {:#?}", &ifaces);
 
     if ifaces.contains(&n.to_string()) {
-        println!("        interface {} exists", n);
+        info!(log, "interface {} exists already", n);
         Ok(false)
     } else {
-        println!("        interface {} NEEDS CREATION", n);
+        info!(log, "interface {} NEEDS CREATION", n);
         let output = Command::new("/usr/sbin/ipadm")
             .env_clear()
             .arg("create-if")
@@ -548,47 +546,42 @@ fn ensure_ipadm_interface(n: &str) -> Result<bool> {
             .output()?;
 
         if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            bail!("ERROR: ipadm create-if {}: {}", &n, err);
+            bail!("ipadm create-if {}: {}", &n, output.info());
         }
 
         Ok(true)
     }
 }
 
-fn ensure_ipv4_interface(sfx: &str, mac: &str, ipv4: &IPv4, use_gw: bool)
-    -> Result<()>
+fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &IPv4,
+    use_gw: bool) -> Result<()>
 {
-    println!("    ENSURE IPv4 INTERFACE: {}, {:?}, {}", mac, ipv4, use_gw);
+    info!(log, "ENSURE IPv4 INTERFACE: {}, {:?}, {}", mac, ipv4, use_gw);
 
-    println!("    find mac {}", mac);
     let n = match mac_to_nic(mac)? {
-        None => {
-            eprintln!("MAC {} not found", mac);
-            std::process::exit(5);
-        }
+        None => bail!("MAC address {} not found", mac),
         Some(n) => n,
     };
-    println!("        --> {:?}", n);
+    info!(log, "MAC address {} is NIC {}", mac, n);
 
-    ensure_ipadm_interface(&n)?;
+    ensure_ipadm_interface(log, &n)?;
 
     let targ = ipv4.cidr()?;
-    println!("    target IP: {}", targ);
+    info!(log, "target IP address: {}", targ);
 
     let addrs = ipadm_address_list()?;
-    println!(" * ADDRESSES: {:?}", &addrs);
+    info!(log, "ADDRESSES: {:?}", &addrs);
 
     let mut found = false;
     for addr in &addrs {
         if addr.cidr == targ {
-            println!("    ipadm address exists: {:?}", addr);
+            info!(log, "ipadm address exists: {:?}", addr);
             found = true;
         }
     }
 
     if !found {
-        println!("    ipadm address {} NEEDS CREATION", &targ);
+        info!(log, "ipadm address {} NEEDS CREATION", &targ);
         let output = Command::new("/usr/sbin/ipadm")
             .env_clear()
             .arg("create-addr")
@@ -598,8 +591,7 @@ fn ensure_ipv4_interface(sfx: &str, mac: &str, ipv4: &IPv4, use_gw: bool)
             .output()?;
 
         if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            bail!("ipadm create-addr {} {}: {}", &targ, n, err);
+            bail!("ipadm create-addr {} {}: {}", &targ, n, output.info());
         }
     }
 
@@ -618,13 +610,12 @@ fn ensure_ipv4_interface(sfx: &str, mac: &str, ipv4: &IPv4, use_gw: bool)
                 .output()?;
 
             if !output.status.success() {
-                let err = String::from_utf8_lossy(&output.stderr);
-                bail!("route add: {}", err);
+                warn!(log, "route add failure: {}", output.info());
             }
         }
     }
 
-    println!("    ok, interface {}  address {} ({}) complete", n, targ, sfx);
+    info!(log, "ok, interface {}  address {} ({}) complete", n, targ, sfx);
     Ok(())
 }
 
@@ -703,7 +694,7 @@ fn run(log: &Logger) -> Result<()> {
             .output()?;
 
         if !output.status.success() {
-            bail!("mount: {:?}", output.stderr);
+            bail!("mount: {}", output.info());
         }
 
         info!(log, "mount ok at {}", MOUNTPOINT);
@@ -798,7 +789,7 @@ fn run(log: &Logger) -> Result<()> {
         info!(log, "adding swap to vfstab");
         vfstab.push("".into());
         vfstab.push(format!("{}\t-\t-\tswap\t-\tno\t-", swapdev));
-        write_lines("/etc/vfstab", &vfstab)?;
+        write_lines(log, "/etc/vfstab", &vfstab)?;
 
         swapadd()?;
     } else {
@@ -830,7 +821,7 @@ fn run(log: &Logger) -> Result<()> {
          * Write the file after we set the live system hostname, so that if we
          * are restarted we don't forget to do that part.
          */
-        write_lines("/etc/nodename", &[ &md.hostname ])?;
+        write_lines(log, "/etc/nodename", &[ &md.hostname ])?;
 
     } else {
         info!(log, "NODENAME \"{}\" OK ALREADY", &md.hostname);
@@ -887,7 +878,7 @@ fn run(log: &Logger) -> Result<()> {
             format!("{}", fore)
         }
     }).collect();
-    write_lines("/etc/inet/hosts", &hostsout)?;
+    write_lines(log, "/etc/inet/hosts", &hostsout)?;
 
     /*
      * Check network configuration:
@@ -897,7 +888,7 @@ fn run(log: &Logger) -> Result<()> {
             continue;
         }
 
-        if let Err(e) = ensure_ipv4_interface("private", &iface.mac,
+        if let Err(e) = ensure_ipv4_interface(log, "private", &iface.mac,
             &iface.ipv4, false)
         {
             /*
@@ -913,7 +904,7 @@ fn run(log: &Logger) -> Result<()> {
             continue;
         }
 
-        if let Err(e) = ensure_ipv4_interface("public", &iface.mac,
+        if let Err(e) = ensure_ipv4_interface(log, "public", &iface.mac,
             &iface.ipv4, true)
         {
             /*
@@ -924,7 +915,7 @@ fn run(log: &Logger) -> Result<()> {
         }
 
         if let Some(anchor) = &iface.anchor_ipv4 {
-            if let Err(e) = ensure_ipv4_interface("anchor", &iface.mac,
+            if let Err(e) = ensure_ipv4_interface(log, "anchor", &iface.mac,
                 &anchor, false)
             {
                 error!(log, "ANCHOR IFACE ERROR: {}", e);
@@ -965,7 +956,7 @@ fn run(log: &Logger) -> Result<()> {
     }
 
     if dirty {
-        write_lines("/etc/resolv.conf", file.as_ref())?;
+        write_lines(log, "/etc/resolv.conf", file.as_ref())?;
     }
 
     /*
@@ -985,10 +976,10 @@ fn run(log: &Logger) -> Result<()> {
     }
 
     if dirty {
-        write_lines("/root/.ssh/authorized_keys", file.as_ref())?;
+        write_lines(log, "/root/.ssh/authorized_keys", file.as_ref())?;
     }
 
-    write_lines(STAMP, &[md.droplet_id.to_string()])?;
+    write_lines(log, STAMP, &[md.droplet_id.to_string()])?;
 
     Ok(())
 }
