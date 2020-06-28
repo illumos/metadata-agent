@@ -4,16 +4,6 @@ use std::io::Write;
 
 use super::common::*;
 
-trait OutputExt {
-    fn info(&self) -> String;
-}
-
-impl OutputExt for std::process::Output {
-    fn info(&self) -> String {
-        String::from_utf8_lossy(&self.stderr).trim().to_string()
-    }
-}
-
 pub fn fmthard(log: &Logger, disk: &str, part: &str, tag: &str, flag: &str,
     start: u64, size: u64) -> Result<()>
 {
