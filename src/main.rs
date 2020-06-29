@@ -543,41 +543,61 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &IPv4,
     let targ = ipv4.cidr()?;
     info!(log, "target IP address: {}", targ);
 
+    let targname = format!("{}/{}", n, sfx);
+    info!(log, "target IP name: {}", targ);
+
     let addrs = ipadm_address_list()?;
     info!(log, "ADDRESSES: {:?}", &addrs);
 
-    let mut found = false;
+    let mut name_found = false;
+    let mut address_found = false;
     for addr in &addrs {
+        if addr.name == targname {
+            info!(log, "ipadm address with name exists: {:?}", addr);
+            name_found = true;
+        }
         if addr.cidr == targ {
-            info!(log, "ipadm address exists: {:?}", addr);
-            found = true;
+            info!(log, "ipadm address with correct IP exists: {:?}", addr);
+            address_found = true;
         }
     }
 
-    if !found {
+    if name_found && !address_found {
+        info!(log, "ipadm address exists but with wrong IP address, deleting");
+        let output = Command::new("/usr/sbin/ipadm")
+            .env_clear()
+            .arg("delete-addr")
+            .arg(&targname)
+            .output()?;
+
+        if !output.status.success() {
+            bail!("ipadm delete-addr {}: {}", &targname, output.info());
+        }
+    }
+
+    if !address_found {
         info!(log, "ipadm address {} NEEDS CREATION", &targ);
         let output = Command::new("/usr/sbin/ipadm")
             .env_clear()
             .arg("create-addr")
             .arg("-T").arg("static")
             .arg("-a").arg(&targ)
-            .arg(format!("{}/{}", n, sfx))
+            .arg(&targname)
             .output()?;
 
         if !output.status.success() {
-            bail!("ipadm create-addr {} {}: {}", &targ, n, output.info());
+            bail!("ipadm create-addr {} {}: {}", &targname, &targ,
+                output.info());
         }
     }
 
     if use_gw {
-        let mut defrouters = read_lines_maybe(DEFROUTER)?;
-        let mut dirty = false;
-        info!(log, "existing default routers: {:?}", &defrouters);
+        let orig_defrouters = read_lines_maybe(DEFROUTER)?;
+        let defrouters = &[ipv4.gateway.as_str()];
+        info!(log, "existing default routers: {:?}", &orig_defrouters);
 
-        if !defrouters.contains(&ipv4.gateway) {
-            info!(log, "    ADD GATEWAY {}", &ipv4.gateway);
-            defrouters.insert(0, ipv4.gateway.clone());
-            dirty = true;
+        if orig_defrouters.as_slice() != defrouters {
+            info!(log, "    SET GATEWAY {}", &ipv4.gateway);
 
             /*
              * This attempts to add the default route to the live system.  It
@@ -595,10 +615,8 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &IPv4,
             if !output.status.success() {
                 warn!(log, "route add failure: {}", output.info());
             }
-        }
 
-        if dirty {
-            write_lines(log, DEFROUTER, defrouters.as_slice())?;
+            write_lines(log, DEFROUTER, defrouters)?;
         }
     }
 
