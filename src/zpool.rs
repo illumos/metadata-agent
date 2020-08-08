@@ -41,6 +41,20 @@ pub fn zpool_expand(pool: &str, disk: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn zpool_reguid(pool: &str) -> Result<()> {
+    let output = std::process::Command::new("/sbin/zpool")
+        .env_clear()
+        .arg("reguid")
+        .arg(pool)
+        .output()?;
+
+    if !output.status.success() {
+        bail!("zpool reguid failure: {}", output.info());
+    }
+
+    Ok(())
+}
+
 pub fn zpool_disk() -> Result<String> {
     let pool = "rpool";
     let output = std::process::Command::new("/sbin/zpool")

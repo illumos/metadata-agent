@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
 
-<service_bundle type='manifest' name='digitalocean-metadata'>
+<service_bundle type='manifest' name='illumos-metadata'>
 
-<service name='system/digitalocean/metadata' type='service' version='1'>
+<service name='system/illumos/metadata' type='service' version='1'>
   <create_default_instance enabled='true' />
   <single_instance />
 
@@ -70,7 +70,8 @@
     <service_fmri value='svc:/network/routing-setup' />
   </dependent>
 
-  <exec_method type='method' name='start' exec='/usr/lib/digitalocean'
+  <exec_method type='method' name='start'
+    exec='/usr/lib/metadata | tee /dev/msglog'
     timeout_seconds='300' />
 
   <exec_method type='method' name='stop' exec=':true' timeout_seconds='3' />
@@ -83,7 +84,7 @@
 
   <template>
     <common_name>
-      <loctext xml:lang='C'>DigitalOcean Metadata</loctext>
+      <loctext xml:lang='C'>illumos Metadata Agent</loctext>
     </common_name>
     <description>
       <loctext xml:lang='C'>Configures guest based on Metadata</loctext>

@@ -17,9 +17,78 @@ use common::*;
 
 
 const MOUNTPOINT: &str = "/var/metadata";
-const STAMP: &str = "/var/adm/digitalocean.stamp";
+const STAMP: &str = "/var/adm/metadata.stamp";
 const DEFROUTER: &str = "/etc/defaultrouter";
+const MDATA_GET: &str = "/usr/sbin/mdata-get";
 
+enum Mdata {
+    Found(String),
+    NotFound,
+    WrongHypervisor,
+}
+
+fn mdata_get(log: &Logger, key: &str) -> Result<Mdata> {
+    info!(log, "mdata-get \"{}\"...", key);
+    let output = Command::new(MDATA_GET)
+        .env_clear()
+        .arg(key)
+        .output()?;
+
+    Ok(match output.status.code() {
+        Some(0) => {
+            let out = String::from_utf8(output.stdout)?
+                .trim_end_matches('\n')
+                .to_string();
+            info!(log, "mdata for \"{}\" -> \"{}\"", key, out);
+            Mdata::Found(out)
+        }
+        Some(1) => {
+            warn!(log, "mdata for \"{}\" not found", key);
+            Mdata::NotFound
+        }
+        Some(2) => {
+            /*
+             * An unexpected permanent failure occurred, which likely means we
+             * cannot use "mdata-get" for metadata on this system.  Assume this
+             * is not a SmartOS system.
+             */
+            warn!(log, "mdata wrong hypervisor: {}", output.info());
+            Mdata::WrongHypervisor
+        }
+        _ => bail!("mdata-get: unexpected failure: {}", output.info()),
+    })
+}
+
+fn mdata_probe(log: &Logger) -> Result<bool> {
+    /*
+     * Check for an mdata-get(1M) binary on this system:
+     */
+    if !exists_file(MDATA_GET)? {
+        /*
+         * If the program is not there at all, this is not an image for a guest
+         * on a SmartOS hypervisor.
+         */
+        return Ok(false);
+    }
+
+    match mdata_get(log, "sdc:uuid")? {
+        Mdata::Found(_) | Mdata::NotFound => {
+            /*
+             * Whether found or not found, we were able to speak to the
+             * hypervisor.  Treat this as a SmartOS system.
+             */
+            Ok(true)
+        }
+        Mdata::WrongHypervisor => {
+            /*
+             * An unexpected permanent failure occurred, which likely means we
+             * cannot use "mdata-get" for metadata on this system.  Assume this
+             * is not a SmartOS system.
+             */
+            Ok(false)
+        }
+    }
+}
 
 pub fn write_file(p: &str, data: &str) -> Result<()> {
     let f = std::fs::OpenOptions::new()
@@ -150,7 +219,9 @@ struct Interface {
 
 #[derive(Debug,Deserialize)]
 struct Interfaces {
+    #[serde(default)]
     public: Vec<Interface>,
+    #[serde(default)]
     private: Vec<Interface>,
 }
 
@@ -165,6 +236,24 @@ struct Metadata {
     public_keys: Vec<String>,
     region: String,
     features: HashMap<String, bool>,
+}
+
+#[derive(Debug,Deserialize)]
+struct SdcNic {
+    mac: String,
+    interface: String,
+    #[serde(default)]
+    ips: Vec<String>,
+    #[serde(default)]
+    gateways: Vec<String>,
+    primary: Option<bool>,
+    nic_tag: Option<String>,
+}
+
+impl SdcNic {
+    fn primary(&self) -> bool {
+        self.primary.unwrap_or(false)
+    }
 }
 
 /**
@@ -219,6 +308,22 @@ fn exists_dir(p: &str) -> Result<bool> {
 
     if !md.is_dir() {
         bail!("\"{}\" exists but is not a directory", p);
+    }
+
+    Ok(true)
+}
+
+fn exists_file(p: &str) -> Result<bool> {
+    let md = match std::fs::metadata(p) {
+        Ok(md) => md,
+        Err(e) => match e.kind() {
+            ErrorKind::NotFound => return Ok(false),
+            _ => bail!("checking {}: {}", p, e),
+        },
+    };
+
+    if !md.is_file() {
+        bail!("\"{}\" exists but is not a file", p);
     }
 
     Ok(true)
@@ -527,10 +632,43 @@ fn ensure_ipadm_interface(log: &Logger, n: &str) -> Result<bool> {
     }
 }
 
-fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &IPv4,
-    use_gw: bool) -> Result<()>
+fn ensure_ipv4_gateway(log: &Logger, gateway: &str) -> Result<()> {
+    info!(log, "ENSURE IPv4 GATEWAY: {}", gateway);
+
+    let orig_defrouters = read_lines_maybe(DEFROUTER)?;
+    let defrouters = &[gateway];
+    info!(log, "existing default routers: {:?}", &orig_defrouters);
+
+    if orig_defrouters.as_slice() != defrouters {
+        info!(log, "    SET GATEWAY {}", gateway);
+
+        /*
+         * This attempts to add the default route to the live system.  It
+         * may fail (e.g., if the route already exists) but we should just
+         * report and ignore such a failure as long as we are able to write
+         * the config file.
+         */
+        let output = Command::new("/usr/sbin/route")
+            .env_clear()
+            .arg("add")
+            .arg("default")
+            .arg(gateway)
+            .output()?;
+
+        if !output.status.success() {
+            warn!(log, "route add failure: {}", output.info());
+        }
+
+        write_lines(log, DEFROUTER, defrouters)?;
+    }
+
+    Ok(())
+}
+
+fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &str)
+    -> Result<()>
 {
-    info!(log, "ENSURE IPv4 INTERFACE: {}, {:?}, {}", mac, ipv4, use_gw);
+    info!(log, "ENSURE IPv4 INTERFACE: {}, {:?}", mac, ipv4);
 
     let n = match mac_to_nic(mac)? {
         None => bail!("MAC address {} not found", mac),
@@ -540,11 +678,10 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &IPv4,
 
     ensure_ipadm_interface(log, &n)?;
 
-    let targ = ipv4.cidr()?;
-    info!(log, "target IP address: {}", targ);
+    info!(log, "target IP address: {}", ipv4);
 
     let targname = format!("{}/{}", n, sfx);
-    info!(log, "target IP name: {}", targ);
+    info!(log, "target IP name: {}", targname);
 
     let addrs = ipadm_address_list()?;
     info!(log, "ADDRESSES: {:?}", &addrs);
@@ -556,7 +693,7 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &IPv4,
             info!(log, "ipadm address with name exists: {:?}", addr);
             name_found = true;
         }
-        if addr.cidr == targ {
+        if addr.cidr == ipv4 {
             info!(log, "ipadm address with correct IP exists: {:?}", addr);
             address_found = true;
         }
@@ -576,51 +713,22 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &IPv4,
     }
 
     if !address_found {
-        info!(log, "ipadm address {} NEEDS CREATION", &targ);
+        info!(log, "ipadm address {} NEEDS CREATION", ipv4);
         let output = Command::new("/usr/sbin/ipadm")
             .env_clear()
             .arg("create-addr")
             .arg("-T").arg("static")
-            .arg("-a").arg(&targ)
+            .arg("-a").arg(ipv4)
             .arg(&targname)
             .output()?;
 
         if !output.status.success() {
-            bail!("ipadm create-addr {} {}: {}", &targname, &targ,
+            bail!("ipadm create-addr {} {}: {}", &targname, ipv4,
                 output.info());
         }
     }
 
-    if use_gw {
-        let orig_defrouters = read_lines_maybe(DEFROUTER)?;
-        let defrouters = &[ipv4.gateway.as_str()];
-        info!(log, "existing default routers: {:?}", &orig_defrouters);
-
-        if orig_defrouters.as_slice() != defrouters {
-            info!(log, "    SET GATEWAY {}", &ipv4.gateway);
-
-            /*
-             * This attempts to add the default route to the live system.  It
-             * may fail (e.g., if the route already exists) but we should just
-             * report and ignore such a failure as long as we are able to write
-             * the config file.
-             */
-            let output = Command::new("/usr/sbin/route")
-                .env_clear()
-                .arg("add")
-                .arg("default")
-                .arg(&ipv4.gateway)
-                .output()?;
-
-            if !output.status.success() {
-                warn!(log, "route add failure: {}", output.info());
-            }
-
-            write_lines(log, DEFROUTER, defrouters)?;
-        }
-    }
-
-    info!(log, "ok, interface {}  address {} ({}) complete", n, targ, sfx);
+    info!(log, "ok, interface {} address {} ({}) complete", n, ipv4, sfx);
     Ok(())
 }
 
@@ -633,7 +741,7 @@ fn main() {
             std::process::exit(0);
         }
         Err(e) => {
-            error!(log, "fatal error: {}", e);
+            error!(log, "fatal error: {:?}", e);
             std::process::exit(1);
         }
     }
@@ -650,6 +758,131 @@ fn run(log: &Logger) -> Result<()> {
         bail!("SMF_FMRI is not set; running under SMF?");
     }
 
+    /*
+     * First, expand the ZFS pool.  We can do this prior to metadata access.
+     */
+    phase_expand_zpool(log)?;
+    phase_add_swap(log)?;
+
+    /*
+     * Determine which hypervisor type so that we can select the right
+     * configuration style:
+     */
+    if mdata_probe(log)? {
+        info!(log, "hypervisor type: SmartOS");
+        run_smartos(log)?;
+    } else {
+        info!(log, "hypervisor type: DigitalOcean");
+        run_digitalocean(log)?;
+    }
+
+    Ok(())
+}
+
+fn run_smartos(log: &Logger) -> Result<()> {
+    let uuid = if let Mdata::Found(uuid) = mdata_get(log, "sdc:uuid")? {
+        uuid.trim().to_string()
+    } else {
+        bail!("could not read Guest UUID");
+    };
+
+    /*
+     * Load our stamp file to see if the Guest UUID has changed.
+     */
+    let sl = read_lines(STAMP)?;
+    match sl.as_ref().map(|s| s.as_slice()) {
+        Some([id]) => {
+            if id.trim() == uuid {
+                info!(log, "this guest has already completed first \
+                    boot processing, halting");
+                return Ok(());
+            } else {
+                info!(log, "guest UUID changed ({} -> {}), reprocessing",
+                    id.trim(), uuid);
+            }
+        }
+        _ => (),
+    }
+
+    phase_reguid_zpool(log)?;
+
+    /*
+     * Determine the node name for this guest:
+     */
+    let n = if let Mdata::Found(hostname) = mdata_get(log, "sdc:hostname")? {
+        hostname
+    } else if let Mdata::Found(alias) = mdata_get(log, "sdc:alias")? {
+        alias
+    } else if let Mdata::Found(uuid) = mdata_get(log, "sdc:uuid")? {
+        uuid
+    } else {
+        bail!("could not get hostname or alias or UUID for this VM");
+    }.trim().to_string();
+    info!(log, "VM node name is \"{}\"", n);
+    phase_set_hostname(log, &n)?;
+
+    /*
+     * Get network configuration:
+     */
+    if let Mdata::Found(nics) = mdata_get(log, "sdc:nics")? {
+        let nics: Vec<SdcNic> = serde_json::from_str(&nics)?;
+
+        for nic in nics.iter() {
+            for (i, ip) in nic.ips.iter().enumerate() {
+                if ip == "dhcp" || ip == "addrconf" {
+                    /*
+                     * XXX handle these.
+                     */
+                    error!(log, "interface {} requires {} support",
+                        nic.interface, ip);
+                    continue;
+                }
+
+                let sfx = format!("ip{}", i);
+
+                if let Err(e) = ensure_ipv4_interface(log, &sfx, &nic.mac,
+                    &ip)
+                {
+                    error!(log, "IFACE {}/{} ERROR: {}", nic.interface, sfx, e);
+                }
+            }
+
+            if nic.primary() {
+                for gw in nic.gateways.iter() {
+                    if let Err(e) = ensure_ipv4_gateway(log, gw) {
+                        error!(log, "PRIMARY GATEWAY {} ERROR: {}", gw, e);
+                    }
+                }
+            }
+        }
+    }
+
+    /*
+     * Get DNS servers:
+     */
+    if let Mdata::Found(resolvers) = mdata_get(log, "sdc:resolvers")? {
+        let resolvers: Vec<String> = serde_json::from_str(&resolvers)?;
+
+        phase_dns(log, &resolvers)?;
+    }
+
+    /*
+     * Get public keys:
+     */
+    if let Mdata::Found(pubkeys) = mdata_get(log, "root_authorized_keys")? {
+        let pubkeys: Vec<String> = pubkeys.lines()
+            .map(|s| s.trim().to_string())
+            .collect();
+
+        phase_pubkeys(log, &pubkeys)?;
+    }
+
+    write_lines(log, STAMP, &[uuid])?;
+
+    Ok(())
+}
+
+fn run_digitalocean(log: &Logger) -> Result<()> {
     /*
      * First, locate and mount the metadata ISO.  We need to load the droplet ID
      * so that we can determine if we have completed first boot processing for
@@ -739,9 +972,72 @@ fn run(log: &Logger) -> Result<()> {
         _ => (),
     }
 
+    phase_reguid_zpool(log)?;
+    phase_set_hostname(log, &md.hostname)?;
+
     /*
-     * First, expand the ZFS pool.  We can do this prior to metadata access.
-     *
+     * Check network configuration:
+     */
+    for iface in &md.interfaces.private {
+        if iface.type_ != "private" {
+            continue;
+        }
+
+        if let Err(e) = ensure_ipv4_interface(log, "private", &iface.mac,
+            &iface.ipv4.cidr()?)
+        {
+            /*
+             * Report the error, but drive on in case we can complete other
+             * configuration and make the guest accessible anyway.
+             */
+            error!(log, "PRIV IFACE ERROR: {}", e);
+        }
+    }
+
+    for iface in &md.interfaces.public {
+        if iface.type_ != "public" {
+            continue;
+        }
+
+        if let Err(e) = ensure_ipv4_interface(log, "public", &iface.mac,
+            &iface.ipv4.cidr()?)
+        {
+            /*
+             * Report the error, but drive on in case we can complete other
+             * configuration and make the guest accessible anyway.
+             */
+            error!(log, "PUB IFACE ERROR: {}", e);
+        }
+
+        if let Err(e) = ensure_ipv4_gateway(log, &iface.ipv4.gateway) {
+            error!(log, "PUB GATEWAY ERROR: {}", e);
+        }
+
+        if let Some(anchor) = &iface.anchor_ipv4 {
+            if let Err(e) = ensure_ipv4_interface(log, "anchor", &iface.mac,
+                &anchor.cidr()?)
+            {
+                error!(log, "ANCHOR IFACE ERROR: {}", e);
+            }
+        }
+    }
+
+    phase_dns(log, &md.dns.nameservers)?;
+    phase_pubkeys(log, md.public_keys.as_slice())?;
+
+    write_lines(log, STAMP, &[md.droplet_id.to_string()])?;
+
+    Ok(())
+}
+
+fn phase_reguid_zpool(log: &Logger) -> Result<()> {
+    info!(log, "regenerate pool guid for rpool");
+    zpool::zpool_reguid("rpool")?;
+    Ok(())
+}
+
+fn phase_expand_zpool(log: &Logger) -> Result<()> {
+    /*
      * NOTE: Though it might seem like we could skip directly to using "zpool
      * online -e ...", there appears to be at least one serious deadlock in this
      * code path.  The relabel operation appears to make the device briefly
@@ -766,6 +1062,10 @@ fn run(log: &Logger) -> Result<()> {
     zpool::zpool_expand("rpool", &disk)?;
     info!(log, "zpool expansion ok");
 
+    Ok(())
+}
+
+fn phase_add_swap(log: &Logger) -> Result<()> {
     /*
      * Next, add a swap device.
      */
@@ -801,21 +1101,25 @@ fn run(log: &Logger) -> Result<()> {
         info!(log, "swap already configured in vfstab");
     }
 
+    Ok(())
+}
+
+fn phase_set_hostname(log: &Logger, hostname: &str) -> Result<()> {
     /*
      * Check nodename:
      */
     let write_nodename = if let Some(nodename) = read_file("/etc/nodename")? {
-        nodename.trim() != md.hostname
+        nodename.trim() != hostname
     } else {
         true
     };
 
     if write_nodename {
-        info!(log, "WRITE NODENAME \"{}\"", &md.hostname);
+        info!(log, "WRITE NODENAME \"{}\"", hostname);
 
         let status = Command::new("/usr/bin/hostname")
             .env_clear()
-            .arg(&md.hostname)
+            .arg(hostname)
             .status()?;
 
         if !status.success() {
@@ -826,10 +1130,10 @@ fn run(log: &Logger) -> Result<()> {
          * Write the file after we set the live system hostname, so that if we
          * are restarted we don't forget to do that part.
          */
-        write_lines(log, "/etc/nodename", &[ &md.hostname ])?;
+        write_lines(log, "/etc/nodename", &[ hostname ])?;
 
     } else {
-        info!(log, "NODENAME \"{}\" OK ALREADY", &md.hostname);
+        info!(log, "NODENAME \"{}\" OK ALREADY", hostname);
     }
 
     /*
@@ -870,7 +1174,7 @@ fn run(log: &Logger) -> Result<()> {
                         hosts.push_str(" loghost");
                     }
                     hosts.push_str(&format!(" {}.local {}",
-                        &md.hostname, &md.hostname));
+                        hostname, hostname));
 
                     fore = hosts;
                 }
@@ -885,49 +1189,10 @@ fn run(log: &Logger) -> Result<()> {
     }).collect();
     write_lines(log, "/etc/inet/hosts", &hostsout)?;
 
-    /*
-     * Check network configuration:
-     */
-    for iface in &md.interfaces.private {
-        if iface.type_ != "private" {
-            continue;
-        }
+    Ok(())
+}
 
-        if let Err(e) = ensure_ipv4_interface(log, "private", &iface.mac,
-            &iface.ipv4, false)
-        {
-            /*
-             * Report the error, but drive on in case we can complete other
-             * configuration and make the guest accessible anyway.
-             */
-            error!(log, "PRIV IFACE ERROR: {}", e);
-        }
-    }
-
-    for iface in &md.interfaces.public {
-        if iface.type_ != "public" {
-            continue;
-        }
-
-        if let Err(e) = ensure_ipv4_interface(log, "public", &iface.mac,
-            &iface.ipv4, true)
-        {
-            /*
-             * Report the error, but drive on in case we can complete other
-             * configuration and make the guest accessible anyway.
-             */
-            error!(log, "PUB IFACE ERROR: {}", e);
-        }
-
-        if let Some(anchor) = &iface.anchor_ipv4 {
-            if let Err(e) = ensure_ipv4_interface(log, "anchor", &iface.mac,
-                &anchor, false)
-            {
-                error!(log, "ANCHOR IFACE ERROR: {}", e);
-            }
-        }
-    }
-
+fn phase_dns(log: &Logger, nameservers: &[String]) -> Result<()> {
     /*
      * DNS Servers:
      */
@@ -938,7 +1203,7 @@ fn run(log: &Logger) -> Result<()> {
     let mut dirty = false;
     let mut file: Vec<String> = Vec::new();
 
-    for ns in &md.dns.nameservers {
+    for ns in nameservers.iter() {
         let l = format!("nameserver {}", ns);
         if !lines.contains(&l) {
             info!(log, "ADD DNS CONFIG LINE: {}", l);
@@ -950,7 +1215,7 @@ fn run(log: &Logger) -> Result<()> {
     for l in &lines {
         let ll: Vec<_> = l.splitn(2, ' ').collect();
         if ll.len() == 2 && ll[0] == "nameserver" &&
-            !md.dns.nameservers.contains(&ll[1].to_string())
+            !nameservers.contains(&ll[1].to_string())
         {
             info!(log, "REMOVE DNS CONFIG LINE: {}", l);
             file.push(format!("#{}", l));
@@ -964,15 +1229,27 @@ fn run(log: &Logger) -> Result<()> {
         write_lines(log, "/etc/resolv.conf", file.as_ref())?;
     }
 
+    Ok(())
+}
+
+fn phase_pubkeys(log: &Logger, public_keys: &[String]) -> Result<()> {
     /*
      * Manage the public keys:
      */
     info!(log, "checking SSH public keys...");
+
+    if !exists_dir("/root/.ssh")? {
+        info!(log, "mkdir /root/.ssh");
+        DirBuilder::new()
+            .mode(0o700)
+            .create("/root/.ssh")?;
+    }
+
     let mut file = read_lines_maybe("/root/.ssh/authorized_keys")?;
     info!(log, "existing SSH public keys: {:#?}", &file);
 
     let mut dirty = false;
-    for key in &md.public_keys {
+    for key in public_keys.iter() {
         if !file.contains(key) {
             info!(log, "add SSH public key: {}", key);
             file.push(key.to_string());
@@ -983,8 +1260,6 @@ fn run(log: &Logger) -> Result<()> {
     if dirty {
         write_lines(log, "/root/.ssh/authorized_keys", file.as_ref())?;
     }
-
-    write_lines(log, STAMP, &[md.droplet_id.to_string()])?;
 
     Ok(())
 }
