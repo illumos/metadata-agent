@@ -25,6 +25,38 @@ pub fn fmthard(log: &Logger, disk: &str, part: &str, tag: &str, flag: &str,
     Ok(())
 }
 
+pub fn zpool_logical_size(pool: &str) -> Result<u64> {
+    /*
+     * It is tempting to use "zpool list" to obtain the pool size, but that size
+     * does not account for parity and overhead in the way that one might
+     * intuitively expect.  Instead, we sum the USED and AVAIL output at the
+     * "zfs list" level, which does account for these overheads.
+     */
+    let output = std::process::Command::new("/sbin/zfs")
+        .env_clear()
+        .arg("list")
+        .arg("-o")
+        .arg("used,avail")
+        .arg("-Hp")
+        .arg(pool)
+        .output()?;
+
+    if !output.status.success() {
+        bail!("zpool online failure: {}", output.info());
+    }
+
+    let o = String::from_utf8(output.stdout)?;
+    let t: Vec<_> = o.trim().split_whitespace().collect();
+    if t.len() != 2 {
+        bail!("unexpected output: {}", o);
+    }
+
+    let used: u64 = t[0].parse()?;
+    let avail: u64 = t[1].parse()?;
+
+    Ok(used.saturating_add(avail) / 1024 / 1024)
+}
+
 pub fn zpool_expand(pool: &str, disk: &str) -> Result<()> {
     let output = std::process::Command::new("/sbin/zpool")
         .env_clear()

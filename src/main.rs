@@ -1343,10 +1343,14 @@ fn phase_expand_zpool(log: &Logger) -> Result<()> {
 
 fn phase_add_swap(log: &Logger) -> Result<()> {
     /*
-     * Next, add a swap device.
+     * Next, add a swap device.  Ideally we will have enough room for a swap
+     * file twice the size of physical memory -- but if not, we want to use at
+     * most 20% of the available space in the pool.
      */
+    let swapsize_from_pool = zpool::zpool_logical_size("rpool")? / 5;
+    let swapsize = swapsize_from_pool.min(memsize()? * 2);
+
     let swapdev = "/dev/zvol/dsk/rpool/swap";
-    let swapsize = memsize()? * 2;
     if !exists_zvol("rpool/swap")? {
         info!(log, "create swap zvol...");
         create_zvol("rpool/swap", swapsize)?;
