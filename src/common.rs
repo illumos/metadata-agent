@@ -60,3 +60,7 @@ impl OutputExt for std::process::Output {
         out
     }
 }
+
+pub fn sleep(ms: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}

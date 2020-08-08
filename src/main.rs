@@ -20,6 +20,86 @@ const MOUNTPOINT: &str = "/var/metadata";
 const STAMP: &str = "/var/adm/metadata.stamp";
 const DEFROUTER: &str = "/etc/defaultrouter";
 const MDATA_GET: &str = "/usr/sbin/mdata-get";
+const SMBIOS: &str = "/usr/sbin/smbios";
+
+#[derive(Debug)]
+struct Smbios {
+    manufacturer: String,
+    product: String,
+    version: String,
+}
+
+fn amazon_metadata_get(log: &Logger, key: &str) -> Result<Option<String>> {
+    let url = format!("http://169.254.169.254/latest/meta-data/{}", key);
+
+    let cb = reqwest::blocking::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    loop {
+        match cb.get(&url).send() {
+            Ok(res) => {
+                if res.status().is_success() {
+                    let val = res.text()?.trim_end_matches('\n').to_string();
+                    return Ok(Some(val));
+                } else if res.status().as_u16() == 404 {
+                    return Ok(None);
+                }
+
+                error!(log, "metadata {}: bad status {}", key, res.status());
+            }
+            Err(e) => {
+                error!(log, "metadata {}: bad status {}", key, e);
+            }
+        }
+
+        sleep(5_000);
+    }
+}
+
+fn smbios(log: &Logger) -> Result<Option<Smbios>> {
+    info!(log, "exec: smbios -t 1");
+    let output = Command::new(SMBIOS)
+        .env_clear()
+        .arg("-t")
+        .arg("1")
+        .output()?;
+
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr);
+        if msg.contains("System does not export an SMBIOS table") {
+            Ok(None)
+        } else {
+            bail!("smbios -t 1 failure: {}", output.info());
+        }
+    } else {
+        let mut m = "".to_string();
+        let mut p = "".to_string();
+        let mut v = "".to_string();
+
+        for l in String::from_utf8(output.stdout)?.lines() {
+            let t: Vec<_> = l.trim()
+                .splitn(2, ':')
+                .map(|s| s.trim().to_string())
+                .collect();
+
+            if t.len() != 2 {
+                continue;
+            }
+
+            let val = t[1].trim().to_string();
+
+            match t[0].trim() {
+                "Manufacturer" => m = val,
+                "Product" => p = val,
+                "Version" => v = val,
+                _ => (),
+            }
+        }
+
+        Ok(Some(Smbios { manufacturer: m, product: p, version: v }))
+    }
+}
 
 enum Mdata {
     Found(String),
@@ -665,6 +745,85 @@ fn ensure_ipv4_gateway(log: &Logger, gateway: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str)
+    -> Result<()>
+{
+    info!(log, "ENSURE IPv4 DHCP INTERFACE: {}", n);
+
+    ensure_ipadm_interface(log, &n)?;
+
+    let targname = format!("{}/{}", n, sfx);
+    info!(log, "target IP name: {}", targname);
+
+    let addrs = ipadm_address_list()?;
+    info!(log, "ADDRESSES: {:?}", &addrs);
+
+    let mut name_found = false;
+    let mut address_found = false;
+    for addr in &addrs {
+        if addr.name == targname {
+            info!(log, "ipadm address with name exists: {:?}", addr);
+            name_found = true;
+        }
+        if addr.type_ == "dhcp" {
+            info!(log, "ipadm DHCP address exists: {:?}", addr);
+            address_found = true;
+        }
+    }
+
+    if name_found && !address_found {
+        info!(log, "ipadm address exists but with wrong IP address, deleting");
+        let output = Command::new("/usr/sbin/ipadm")
+            .env_clear()
+            .arg("delete-addr")
+            .arg(&targname)
+            .output()?;
+
+        if !output.status.success() {
+            bail!("ipadm delete-addr {}: {}", &targname, output.info());
+        }
+    }
+
+    if !address_found {
+        info!(log, "ipadm DHCP address NEEDS CREATION");
+        let output = Command::new("/usr/sbin/ipadm")
+            .env_clear()
+            .arg("create-addr")
+            .arg("-T").arg("dhcp")
+            .arg("-1")
+            .arg("-w").arg("10")
+            .arg(&targname)
+            .output()?;
+
+        if !output.status.success() {
+            bail!("ipadm create-addr {} DHCP: {}", &targname, output.info());
+        }
+    }
+
+    /*
+     * Wait for the interface to be in the OK state:
+     */
+    loop {
+        let list = ipadm_address_list()?;
+        let addr = list.iter().find(|a| &a.name == &targname);
+
+        info!(log, "address state: {:?}", addr);
+
+        if let Some(addr) = addr {
+            if addr.state == "ok" {
+                info!(log, "ok, interface {} address {} ({}) complete",
+                    n, addr.cidr, sfx);
+                return Ok(());
+            }
+        } else {
+            bail!("address for {} not found?! {:#?}", targname, list);
+        }
+
+        info!(log, "waiting for DHCP...");
+        sleep(5_000);
+    }
+}
+
 fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &str)
     -> Result<()>
 {
@@ -765,16 +924,110 @@ fn run(log: &Logger) -> Result<()> {
     phase_add_swap(log)?;
 
     /*
-     * Determine which hypervisor type so that we can select the right
-     * configuration style:
+     * Try first to use SMBIOS information to determine what kind of hypervisor
+     * this guest is running on:
+     */
+    if let Some(smbios) = smbios(log)? {
+        info!(log, "SMBIOS information: {:?}", smbios);
+
+        match (smbios.manufacturer.as_str(), smbios.product.as_str()) {
+            ("Joyent", "SmartOS HVM") => {
+                info!(log, "hypervisor type: SmartOS (from SMBIOS)");
+                run_smartos(log)?;
+                return Ok(());
+            }
+            ("DigitalOcean", "Droplet") => {
+                info!(log, "hypervisor type: DigitalOcean (from SMBIOS)");
+                run_digitalocean(log)?;
+                return Ok(());
+            }
+            ("Xen", "HVM domU") => {
+                if smbios.version.contains("amazon") {
+                    info!(log, "hypervisor type: Amazon AWS (from SMBIOS)");
+                    run_amazon(log)?;
+                    return Ok(());
+                }
+            }
+            _ => error!(log, "unrecognised SMBIOS information"),
+        }
+    }
+
+    /*
+     * If we could not guess based on the hypervisor, fall back to probing:
      */
     if mdata_probe(log)? {
-        info!(log, "hypervisor type: SmartOS");
+        info!(log, "hypervisor type: SmartOS (mdata probe)");
         run_smartos(log)?;
-    } else {
-        info!(log, "hypervisor type: DigitalOcean");
-        run_digitalocean(log)?;
+        return Ok(());
     }
+
+    /*
+     * As a last level fallback, try the DigitalOcean mechanism:
+     */
+    info!(log, "hypervisor type: DigitalOcean (wild guess)");
+    run_digitalocean(log)?;
+    Ok(())
+}
+
+fn run_amazon(log: &Logger) -> Result<()> {
+    /*
+     * Sadly, Amazon has no mechanism for metadata access that does not require
+     * a correctly configured IP interface.  Assume that we need to start DHCP
+     * on a single Xen virtual ethernet interface:
+     */
+    ensure_ipv4_interface_dhcp(log, "dhcp", "xnf0")?;
+
+    /*
+     * Determine the instance ID, using the metadata service:
+     */
+    let instid = if let Some(id) = amazon_metadata_get(log, "instance-id")? {
+        id
+    } else {
+        bail!("could not determine instance ID");
+    };
+
+    /*
+     * Load our stamp file to see if the Instance ID has changed.
+     */
+    let sl = read_lines(STAMP)?;
+    match sl.as_ref().map(|s| s.as_slice()) {
+        Some([id]) => {
+            if id.trim() == instid {
+                info!(log, "this guest has already completed first \
+                    boot processing, halting");
+                return Ok(());
+            } else {
+                info!(log, "guest Instance ID changed ({} -> {}), reprocessing",
+                    id.trim(), instid);
+            }
+        }
+        _ => (),
+    }
+
+    phase_reguid_zpool(log)?;
+
+    /*
+     * Determine the node name for this guest:
+     */
+    let n = if let Some(hostname) = amazon_metadata_get(log, "hostname")? {
+        hostname
+    } else {
+        bail!("could not get hostname for this VM");
+    }.trim().to_string();
+    info!(log, "VM node name is \"{}\"", n);
+    phase_set_hostname(log, &n)?;
+
+    /*
+     * Get public key:
+     */
+    if let Some(pk) = amazon_metadata_get(log, "public-keys/0/openssh-key")? {
+        let pubkeys = vec![pk];
+        phase_pubkeys(log, &pubkeys)?;
+    } else {
+        warn!(log, "no SSH public key?");
+    }
+
+    write_lines(log, STAMP, &[instid])?;
 
     Ok(())
 }
