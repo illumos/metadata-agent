@@ -21,6 +21,7 @@ const STAMP: &str = "/var/adm/metadata.stamp";
 const DEFROUTER: &str = "/etc/defaultrouter";
 const MDATA_GET: &str = "/usr/sbin/mdata-get";
 const SMBIOS: &str = "/usr/sbin/smbios";
+const DHCPINFO: &str = "/sbin/dhcpinfo";
 
 #[derive(Debug)]
 struct Smbios {
@@ -54,6 +55,26 @@ fn amazon_metadata_get(log: &Logger, key: &str) -> Result<Option<String>> {
         }
 
         sleep(5_000);
+    }
+}
+
+fn dhcpinfo(log: &Logger, key: &str) -> Result<Option<String>> {
+    info!(log, "exec: dhcpinfo {}", key);
+    let output = Command::new(DHCPINFO)
+        .env_clear()
+        .arg(key)
+        .output()?;
+
+    if !output.status.success() {
+        bail!("dhcpinfo {} failed: {}", key, output.info());
+    }
+
+    let out = String::from_utf8(output.stdout)?;
+    let out = out.trim();
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out.to_string()))
     }
 }
 
@@ -1009,12 +1030,14 @@ fn run_amazon(log: &Logger) -> Result<()> {
     /*
      * Determine the node name for this guest:
      */
-    let n = if let Some(hostname) = amazon_metadata_get(log, "hostname")? {
-        hostname
+    let (src, n) = if let Some(hostname) = dhcpinfo(log, "hostname")? {
+        ("DHCP", hostname.trim().to_string())
+    } else if let Some(hostname) = amazon_metadata_get(log, "hostname")? {
+        ("metadata", hostname.trim().to_string())
     } else {
         bail!("could not get hostname for this VM");
-    }.trim().to_string();
-    info!(log, "VM node name is \"{}\"", n);
+    };
+    info!(log, "VM node name is \"{}\" (from {})", n, src);
     phase_set_hostname(log, &n)?;
 
     /*
