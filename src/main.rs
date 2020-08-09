@@ -942,7 +942,7 @@ fn run(log: &Logger) -> Result<()> {
      * First, expand the ZFS pool.  We can do this prior to metadata access.
      */
     phase_expand_zpool(log)?;
-    phase_add_swap(log)?;
+    phase_add_swap(log).map_err(|e| error!(log, "add swap failed: {}", e)).ok();
 
     /*
      * Try first to use SMBIOS information to determine what kind of hypervisor
