@@ -232,6 +232,9 @@ pub fn format_expand(log: &Logger, disk: &str) -> Result<()> {
         bail!("format failure: {}", output.info());
     }
 
+    info!(log, "format stdout: |{}|", String::from_utf8_lossy(&output.stdout));
+    info!(log, "format stderr: |{}|", String::from_utf8_lossy(&output.stderr));
+
     Ok(())
 }
 
