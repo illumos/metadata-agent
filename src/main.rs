@@ -3,8 +3,8 @@ use std::io::Read;
 use std::io::Write;
 use std::io::ErrorKind;
 use std::collections::HashMap;
-use std::fs::DirBuilder;
-use std::os::unix::fs::DirBuilderExt;
+use std::fs::{self, DirBuilder};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::process::Command;
 
 use serde::Deserialize;
@@ -16,12 +16,27 @@ mod common;
 use common::*;
 
 
-const MOUNTPOINT: &str = "/var/metadata";
-const STAMP: &str = "/var/adm/metadata.stamp";
+const METADATA_DIR: &str = "/var/metadata";
+const STAMP: &str = "/var/metadata/stamp";
+const USERSCRIPT: &str = "/var/metadata/userscript";
+const MOUNTPOINT: &str = "/var/metadata/iso";
+
 const DEFROUTER: &str = "/etc/defaultrouter";
-const MDATA_GET: &str = "/usr/sbin/mdata-get";
-const SMBIOS: &str = "/usr/sbin/smbios";
+
 const DHCPINFO: &str = "/sbin/dhcpinfo";
+const DLADM: &str = "/usr/sbin/dladm";
+const FSTYP: &str = "/usr/sbin/fstyp";
+const HOSTNAME: &str = "/usr/bin/hostname";
+const IPADM: &str = "/usr/sbin/ipadm";
+const MDATA_GET: &str = "/usr/sbin/mdata-get";
+const MOUNT: &str = "/sbin/mount";
+const PRTCONF: &str = "/usr/sbin/prtconf";
+const SMBIOS: &str = "/usr/sbin/smbios";
+const SVCADM: &str = "/usr/sbin/svcadm";
+const SWAPADD: &str = "/sbin/swapadd";
+const ZFS: &str = "/sbin/zfs";
+
+const FMRI_USERSCRIPT: &str = "svc:/system/illumos/userscript:default";
 
 #[derive(Debug)]
 struct Smbios {
@@ -56,6 +71,21 @@ fn amazon_metadata_get(log: &Logger, key: &str) -> Result<Option<String>> {
 
         sleep(5_000);
     }
+}
+
+fn smf_enable(log: &Logger, fmri: &str) -> Result<()> {
+    info!(log, "exec: svcadm enable {}", fmri);
+    let output = Command::new(SVCADM)
+        .env_clear()
+        .arg("enable")
+        .arg(fmri)
+        .output()?;
+
+    if !output.status.success() {
+        bail!("svcadm enable {} failed: {}", fmri, output.info());
+    }
+
+    Ok(())
 }
 
 fn dhcpinfo(log: &Logger, key: &str) -> Result<Option<String>> {
@@ -449,7 +479,7 @@ fn find_device() -> Result<Option<String>> {
         /*
          * Determine which type of file system resides on the device:
          */
-        let output = Command::new("/usr/sbin/fstyp")
+        let output = Command::new(FSTYP)
             .env_clear()
             .arg(ent.path())
             .output()?;
@@ -534,7 +564,7 @@ fn parse_net_adm(stdout: Vec<u8>) -> Result<Vec<Vec<String>>> {
 }
 
 fn ipadm_interface_list() -> Result<Vec<String>> {
-    let output = Command::new("/usr/sbin/ipadm")
+    let output = Command::new(IPADM)
         .env_clear()
         .arg("show-if")
         .arg("-p")
@@ -559,7 +589,7 @@ struct IpadmAddress {
 }
 
 fn ipadm_address_list() -> Result<Vec<IpadmAddress>> {
-    let output = Command::new("/usr/sbin/ipadm")
+    let output = Command::new(IPADM)
         .env_clear()
         .arg("show-addr")
         .arg("-p")
@@ -606,7 +636,7 @@ fn mac_sanitise(input: &str) -> String {
 }
 
 fn mac_to_nic(mac: &str) -> Result<Option<String>> {
-    let output = Command::new("/usr/sbin/dladm")
+    let output = Command::new(DLADM)
         .env_clear()
         .arg("show-phys")
         .arg("-m")
@@ -638,20 +668,20 @@ fn mac_to_nic(mac: &str) -> Result<Option<String>> {
 }
 
 fn memsize() -> Result<u64> {
-    let output = std::process::Command::new("/usr/sbin/prtconf")
+    let output = std::process::Command::new(PRTCONF)
         .env_clear()
         .arg("-m")
         .output()?;
 
     if !output.status.success() {
-        bail!("ipadm failed: {}", output.info());
+        bail!("prtconf failed: {}", output.info());
     }
 
     Ok(String::from_utf8(output.stdout)?.trim().parse()?)
 }
 
 fn create_zvol(name: &str, size_mib: u64) -> Result<()> {
-    let output = std::process::Command::new("/usr/sbin/zfs")
+    let output = std::process::Command::new(ZFS)
         .env_clear()
         .arg("create")
         .arg("-V").arg(format!("{}m", size_mib))
@@ -666,7 +696,7 @@ fn create_zvol(name: &str, size_mib: u64) -> Result<()> {
 }
 
 fn exists_zvol(name: &str) -> Result<bool> {
-    let output = std::process::Command::new("/usr/sbin/zfs")
+    let output = std::process::Command::new(ZFS)
         .env_clear()
         .arg("list")
         .arg("-Hp")
@@ -697,7 +727,7 @@ fn exists_zvol(name: &str) -> Result<bool> {
 }
 
 fn swapadd() -> Result<()> {
-    let output = std::process::Command::new("/sbin/swapadd")
+    let output = std::process::Command::new(SWAPADD)
         .env_clear()
         .output()?;
 
@@ -719,7 +749,7 @@ fn ensure_ipadm_interface(log: &Logger, n: &str) -> Result<bool> {
         Ok(false)
     } else {
         info!(log, "interface {} NEEDS CREATION", n);
-        let output = Command::new("/usr/sbin/ipadm")
+        let output = Command::new(IPADM)
             .env_clear()
             .arg("create-if")
             .arg(n)
@@ -794,7 +824,7 @@ fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str)
 
     if name_found && !address_found {
         info!(log, "ipadm address exists but with wrong IP address, deleting");
-        let output = Command::new("/usr/sbin/ipadm")
+        let output = Command::new(IPADM)
             .env_clear()
             .arg("delete-addr")
             .arg(&targname)
@@ -807,7 +837,7 @@ fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str)
 
     if !address_found {
         info!(log, "ipadm DHCP address NEEDS CREATION");
-        let output = Command::new("/usr/sbin/ipadm")
+        let output = Command::new(IPADM)
             .env_clear()
             .arg("create-addr")
             .arg("-T").arg("dhcp")
@@ -881,7 +911,7 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &str)
 
     if name_found && !address_found {
         info!(log, "ipadm address exists but with wrong IP address, deleting");
-        let output = Command::new("/usr/sbin/ipadm")
+        let output = Command::new(IPADM)
             .env_clear()
             .arg("delete-addr")
             .arg(&targname)
@@ -894,7 +924,7 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &str)
 
     if !address_found {
         info!(log, "ipadm address {} NEEDS CREATION", ipv4);
-        let output = Command::new("/usr/sbin/ipadm")
+        let output = Command::new(IPADM)
             .env_clear()
             .arg("create-addr")
             .arg("-T").arg("static")
@@ -936,6 +966,13 @@ fn run(log: &Logger) -> Result<()> {
         info!(log, "SMF instance: {}", fmri.to_string_lossy());
     } else {
         bail!("SMF_FMRI is not set; running under SMF?");
+    }
+
+    if !exists_dir(METADATA_DIR)? {
+        info!(log, "mkdir {}", METADATA_DIR);
+        DirBuilder::new()
+            .mode(0o700)
+            .create(METADATA_DIR)?;
     }
 
     /*
@@ -1153,6 +1190,14 @@ fn run_smartos(log: &Logger) -> Result<()> {
         phase_pubkeys(log, &pubkeys)?;
     }
 
+    /*
+     * Get userscript:
+     */
+    if let Mdata::Found(userscript) = mdata_get(log, "user-script")? {
+        phase_userscript(log, &userscript)
+            .map_err(|e| error!(log, "failed to get user-script: {}", e)).ok();
+    }
+
     write_lines(log, STAMP, &[uuid])?;
 
     Ok(())
@@ -1200,7 +1245,7 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
             bail!("no hsfs file system found");
         };
 
-        let output = Command::new("/usr/sbin/mount")
+        let output = Command::new(MOUNT)
             .env_clear()
             .arg("-F").arg("hsfs")
             .arg(dev)
@@ -1397,7 +1442,7 @@ fn phase_set_hostname(log: &Logger, hostname: &str) -> Result<()> {
     if write_nodename {
         info!(log, "WRITE NODENAME \"{}\"", hostname);
 
-        let status = Command::new("/usr/bin/hostname")
+        let status = Command::new(HOSTNAME)
             .env_clear()
             .arg(hostname)
             .status()?;
@@ -1540,6 +1585,48 @@ fn phase_pubkeys(log: &Logger, public_keys: &[String]) -> Result<()> {
     if dirty {
         write_lines(log, "/root/.ssh/authorized_keys", file.as_ref())?;
     }
+
+    Ok(())
+}
+
+fn phase_userscript(log: &Logger, userscript: &str) -> Result<()> {
+    /*
+     * First check to see if this is a script with an interpreter line that has
+     * an absolute path; i.e., begins with "#!/".  If not, we will assume it is
+     * in some format we do not understand for now (like the cloud-init format,
+     * etc).
+     */
+    if !userscript.starts_with("#!/") {
+        bail!("userscript does not start with an #!/interpreter line");
+    }
+
+    let us2;
+    let filedata = if !userscript.is_empty() && !userscript.ends_with("\n") {
+        /*
+         * UNIX text files should end with a newline.
+         */
+        us2 = format!("{}\n", userscript);
+        &us2
+    } else {
+        userscript
+    };
+
+    /*
+     * Write userscript to a file, ensuring it is root:root 0700.
+     */
+    write_file(USERSCRIPT, filedata)?;
+
+    /*
+     * Make sure the userscript is executable.
+     */
+    let mut perms = fs::metadata(USERSCRIPT)?.permissions();
+    perms.set_mode(0o700);
+    fs::set_permissions(USERSCRIPT, perms)?;
+
+    /*
+     * Enable the svc:/system/illumos/userscript:default SMF instance.
+     */
+    smf_enable(log, FMRI_USERSCRIPT)?;
 
     Ok(())
 }

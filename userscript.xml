@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
+
+<service_bundle type='manifest' name='illumos-metadata'>
+
+<service name='system/illumos/userscript' type='service' version='1'>
+  <!-- Create this service disabled by default.  If required, it will be
+    enabled by the metadata agent. -->
+  <create_default_instance enabled='false' />
+  <single_instance />
+
+  <!-- Run after the metadata service has completed. -->
+  <dependency name='devices' grouping='require_all' restart_on='none'
+    type='service'>
+    <service_fmri value='svc:/system/illumos/metadata' />
+  </dependency>
+
+  <exec_method type='method' name='start'
+    exec='/usr/lib/userscript.sh'
+    timeout_seconds='3600' />
+
+  <exec_method type='method' name='stop' exec=':true' timeout_seconds='3' />
+
+  <property_group name='startd' type='framework'>
+    <propval name='duration' type='astring' value='transient' />
+  </property_group>
+
+  <stability value='Unstable' />
+
+  <template>
+    <common_name>
+      <loctext xml:lang='C'>illumos Metadata Agent Userscript</loctext>
+    </common_name>
+    <description>
+      <loctext xml:lang='C'>Runs userscript from Metadata</loctext>
+    </description>
+  </template>
+</service>
+
+</service_bundle>
+<!-- vim: set ts=2 sts=2 sw=2 et: -->
