@@ -952,7 +952,7 @@ fn run(log: &Logger) -> Result<()> {
         info!(log, "SMBIOS information: {:?}", smbios);
 
         match (smbios.manufacturer.as_str(), smbios.product.as_str()) {
-            ("Joyent", "SmartOS HVM") => {
+            ("Joyent", "SmartDC HVM") => {
                 info!(log, "hypervisor type: SmartOS (from SMBIOS)");
                 run_smartos(log)?;
                 return Ok(());
