@@ -261,8 +261,8 @@ fn read_file(p: &str) -> Result<Option<String>> {
 }
 
 fn read_lines(p: &str) -> Result<Option<Vec<String>>> {
-    Ok(read_file(p)?.map_or(None, |data| {
-        Some(data.lines().map(|a| a.trim().to_string()).collect())
+    Ok(read_file(p)?.map(|data| {
+        data.lines().map(|a| a.trim().to_string()).collect()
     }))
 }
 
@@ -420,7 +420,7 @@ fn mounts() -> Result<Vec<Mount>> {
             special: r[0].to_string(),
             mount_point: r[1].to_string(),
             fstype: r[2].to_string(),
-            options: options,
+            options,
             time: r[4].parse().expect("mnttab time value"),
         });
     }
@@ -612,7 +612,7 @@ fn ipadm_address_list() -> Result<Vec<IpadmAddress>> {
 
 fn mac_sanitise(input: &str) -> String {
     let mac = input.split(':').fold(String::new(), |mut buf, octet| {
-        if buf.len() > 0 {
+        if !buf.is_empty() {
             /*
              * Put the separating colon back between octets:
              */
@@ -723,7 +723,7 @@ fn exists_zvol(name: &str) -> Result<bool> {
         return Ok(true);
     }
 
-    return Ok(false);
+    Ok(false)
 }
 
 fn swapadd() -> Result<()> {
@@ -856,7 +856,7 @@ fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str)
      */
     loop {
         let list = ipadm_address_list()?;
-        let addr = list.iter().find(|a| &a.name == &targname);
+        let addr = list.iter().find(|a| a.name == targname);
 
         info!(log, "address state: {:?}", addr);
 
@@ -1047,19 +1047,15 @@ fn run_amazon(log: &Logger) -> Result<()> {
     /*
      * Load our stamp file to see if the Instance ID has changed.
      */
-    let sl = read_lines(STAMP)?;
-    match sl.as_ref().map(|s| s.as_slice()) {
-        Some([id]) => {
-            if id.trim() == instid {
-                info!(log, "this guest has already completed first \
-                    boot processing, halting");
-                return Ok(());
-            } else {
-                info!(log, "guest Instance ID changed ({} -> {}), reprocessing",
-                    id.trim(), instid);
-            }
+    if let Some([id]) = read_lines(STAMP)?.as_deref() {
+        if id.trim() == instid {
+            info!(log, "this guest has already completed first \
+                boot processing, halting");
+            return Ok(());
+        } else {
+            info!(log, "guest Instance ID changed ({} -> {}), reprocessing",
+                id.trim(), instid);
         }
-        _ => (),
     }
 
     phase_reguid_zpool(log)?;
@@ -1102,19 +1098,15 @@ fn run_smartos(log: &Logger) -> Result<()> {
     /*
      * Load our stamp file to see if the Guest UUID has changed.
      */
-    let sl = read_lines(STAMP)?;
-    match sl.as_ref().map(|s| s.as_slice()) {
-        Some([id]) => {
-            if id.trim() == uuid {
-                info!(log, "this guest has already completed first \
-                    boot processing, halting");
-                return Ok(());
-            } else {
-                info!(log, "guest UUID changed ({} -> {}), reprocessing",
-                    id.trim(), uuid);
-            }
+    if let Some([id]) = read_lines(STAMP)?.as_deref() {
+        if id.trim() == uuid {
+            info!(log, "this guest has already completed first \
+                boot processing, halting");
+            return Ok(());
+        } else {
+            info!(log, "guest UUID changed ({} -> {}), reprocessing",
+                id.trim(), uuid);
         }
-        _ => (),
     }
 
     phase_reguid_zpool(log)?;
@@ -1276,21 +1268,17 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
     /*
      * Load our stamp file to see if the Droplet ID has changed.
      */
-    let sl = read_lines(STAMP)?;
-    match sl.as_ref().map(|s| s.as_slice()) {
-        Some([id]) => {
-            let expected = md.droplet_id.to_string();
+    if let Some([id]) = read_lines(STAMP)?.as_deref() {
+        let expected = md.droplet_id.to_string();
 
-            if id.trim() == expected {
-                info!(log, "this droplet has already completed first \
-                    boot processing, halting");
-                return Ok(());
-            } else {
-                info!(log, "droplet ID changed ({} -> {}), reprocessing",
-                    id.trim(), expected);
-            }
+        if id.trim() == expected {
+            info!(log, "this droplet has already completed first \
+                boot processing, halting");
+            return Ok(());
+        } else {
+            info!(log, "droplet ID changed ({} -> {}), reprocessing",
+                id.trim(), expected);
         }
-        _ => (),
     }
 
     phase_reguid_zpool(log)?;
@@ -1473,7 +1461,7 @@ fn phase_set_hostname(log: &Logger, hostname: &str) -> Result<()> {
 
         let mut fore = sect[0].to_string();
 
-        if sect[0].trim().len() > 0 {
+        if !sect[0].trim().is_empty() {
             /*
              * If the line has a substantive portion, split that into an IP
              * address and a set of host names:
@@ -1509,7 +1497,7 @@ fn phase_set_hostname(log: &Logger, hostname: &str) -> Result<()> {
         if sect.len() > 1 {
             format!("{}#{}", fore, sect[1])
         } else {
-            format!("{}", fore)
+            fore
         }
     }).collect();
     write_lines(log, "/etc/inet/hosts", &hostsout)?;
@@ -1601,7 +1589,7 @@ fn phase_userscript(log: &Logger, userscript: &str) -> Result<()> {
     }
 
     let us2;
-    let filedata = if !userscript.is_empty() && !userscript.ends_with("\n") {
+    let filedata = if !userscript.is_empty() && !userscript.ends_with('\n') {
         /*
          * UNIX text files should end with a newline.
          */

@@ -111,8 +111,9 @@ pub fn zpool_disk() -> Result<String> {
         l.split('\t').collect::<Vec<_>>()
     }).collect();
 
-    if terms[0].len() < 1 || terms[0][0] != pool ||
-        terms[1].len() < 2 || terms[1][0] != "" {
+    if terms[0].is_empty() || terms[0][0] != pool ||
+        terms[1].len() < 2 || terms[1][0] != ""
+    {
         bail!("zpool list unexpected results: {:?}", terms);
     }
 
@@ -177,7 +178,7 @@ fn prtvtoc(disk: &str) -> Result<Vtoc> {
                 }
             }
             State::After => {
-                if l.starts_with("*") {
+                if l.starts_with('*') {
                     continue;
                 }
 
