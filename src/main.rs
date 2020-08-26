@@ -367,6 +367,7 @@ struct Metadata {
     public_keys: Vec<String>,
     region: String,
     features: HashMap<String, bool>,
+    user_data: Option<String>,
 }
 
 #[derive(Debug,Deserialize)]
@@ -1334,6 +1335,15 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
     phase_dns(log, &md.dns.nameservers)?;
     phase_pubkeys(log, md.public_keys.as_slice())?;
 
+    /*
+     * Get userscript:
+     */
+    if let Some(userscript) = md.user_data.as_deref() {
+        phase_userscript(log, userscript)
+            .map_err(|e| error!(log, "failed to get user-script: {}", e))
+            .ok();
+    }
+
     write_lines(log, STAMP, &[md.droplet_id.to_string()])?;
 
     Ok(())
@@ -1578,6 +1588,13 @@ fn phase_pubkeys(log: &Logger, public_keys: &[String]) -> Result<()> {
 }
 
 fn phase_userscript(log: &Logger, userscript: &str) -> Result<()> {
+    /*
+     * If the userscript is basically empty, just ignore it.
+     */
+    if userscript.trim().is_empty() {
+        return Ok(());
+    }
+
     /*
      * First check to see if this is a script with an interpreter line that has
      * an absolute path; i.e., begins with "#!/".  If not, we will assume it is
