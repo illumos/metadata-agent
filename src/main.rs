@@ -350,10 +350,8 @@ struct Interface {
 
 #[derive(Debug,Deserialize)]
 struct Interfaces {
-    #[serde(default)]
-    public: Vec<Interface>,
-    #[serde(default)]
-    private: Vec<Interface>,
+    public: Option<Vec<Interface>>,
+    private: Option<Vec<Interface>>,
 }
 
 #[derive(Debug,Deserialize)]
@@ -1288,7 +1286,7 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
     /*
      * Check network configuration:
      */
-    for iface in &md.interfaces.private {
+    for iface in md.interfaces.private.as_ref().unwrap_or(&vec![]).iter() {
         if iface.type_ != "private" {
             continue;
         }
@@ -1304,7 +1302,7 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
         }
     }
 
-    for iface in &md.interfaces.public {
+    for iface in md.interfaces.public.as_ref().unwrap_or(&vec![]).iter() {
         if iface.type_ != "public" {
             continue;
         }
