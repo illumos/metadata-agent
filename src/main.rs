@@ -45,8 +45,8 @@ struct Smbios {
     version: String,
 }
 
-fn amazon_metadata_get(log: &Logger, key: &str) -> Result<Option<String>> {
-    let url = format!("http://169.254.169.254/latest/meta-data/{}", key);
+fn amazon_metadata_getx(log: &Logger, key: &str) -> Result<Option<String>> {
+    let url = format!("http://169.254.169.254/latest/{}", key);
 
     let cb = reqwest::blocking::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
@@ -71,6 +71,10 @@ fn amazon_metadata_get(log: &Logger, key: &str) -> Result<Option<String>> {
 
         sleep(5_000);
     }
+}
+
+fn amazon_metadata_get(log: &Logger, key: &str) -> Result<Option<String>> {
+    amazon_metadata_getx(log, &format!("meta-data/{}", key))
 }
 
 fn smf_enable(log: &Logger, fmri: &str) -> Result<()> {
@@ -1080,6 +1084,16 @@ fn run_amazon(log: &Logger) -> Result<()> {
         phase_pubkeys(log, &pubkeys)?;
     } else {
         warn!(log, "no SSH public key?");
+    }
+
+    /*
+     * Get user script:
+     */
+    if let Some(userscript) = amazon_metadata_getx(log, "user-data")? {
+        phase_userscript(log, &userscript)
+            .map_err(|e| error!(log, "failed to get user-script: {}", e)).ok();
+    } else {
+        info!(log, "no user-data?");
     }
 
     write_lines(log, STAMP, &[instid])?;
