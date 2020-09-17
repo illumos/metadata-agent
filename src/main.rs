@@ -638,6 +638,22 @@ fn mac_sanitise(input: &str) -> String {
     mac
 }
 
+fn dladm_ether_list() -> Result<Vec<String>> {
+    let output = Command::new(DLADM)
+        .env_clear()
+        .arg("show-ether")
+        .arg("-p")
+        .arg("-o").arg("link")
+        .output()?;
+
+    if !output.status.success() {
+        bail!("dladm failed: {}", output.info());
+    }
+
+    let ents = parse_net_adm(output.stdout)?;
+    Ok(ents.iter().map(|l| l[0].trim().to_string()).collect())
+}
+
 fn mac_to_nic(mac: &str) -> Result<Option<String>> {
     let output = Command::new(DLADM)
         .env_clear()
@@ -1033,10 +1049,46 @@ fn run(log: &Logger) -> Result<()> {
 fn run_amazon(log: &Logger) -> Result<()> {
     /*
      * Sadly, Amazon has no mechanism for metadata access that does not require
-     * a correctly configured IP interface.  Assume that we need to start DHCP
-     * on a single Xen virtual ethernet interface:
+     * a correctly configured IP interface.  In addition, the available NIC
+     * depends on at least the instance type, if not other configuration.  Find
+     * the right interface for DHCP:
      */
-    ensure_ipv4_interface_dhcp(log, "dhcp", "xnf0")?;
+    let ifaces = dladm_ether_list()?;
+    let mut chosen = None;
+    info!(log, "found these ethernet interfaces: {:?}", ifaces);
+    /*
+     * Prefer ENA devices:
+     */
+    for iface in ifaces.iter() {
+        if iface.starts_with("ena") {
+            chosen = Some(iface.as_str());
+            break;
+        }
+    }
+    /*
+     * If there is no ENA, try for a Xen interface:
+     */
+    if chosen.is_none() {
+        for iface in ifaces.iter() {
+            if iface.starts_with("xnf") {
+                chosen = Some(iface.as_str());
+                break;
+            }
+        }
+    }
+    /*
+     * Otherwise, use whatever we have:
+     */
+    if chosen.is_none() {
+        chosen = ifaces.iter().next().map(|x| x.as_str());
+    }
+
+    if let Some(chosen) = chosen {
+        info!(log, "chose interface {}", chosen);
+        ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
+    } else {
+        bail!("could not find an appropriate Ethernet interface!");
+    }
 
     /*
      * Determine the instance ID, using the metadata service:
