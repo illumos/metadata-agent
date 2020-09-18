@@ -1004,12 +1004,19 @@ fn run(log: &Logger) -> Result<()> {
             }
             ("Xen", "HVM domU") => {
                 if smbios.version.contains("amazon") {
-                    info!(log, "hypervisor type: Amazon AWS (from SMBIOS)");
+                    info!(log, "hypervisor type: Amazon AWS Xen (from SMBIOS)");
                     run_amazon(log)?;
                     return Ok(());
                 }
             }
-            _ => error!(log, "unrecognised SMBIOS information"),
+	    ("Amazon EC2", _) => {
+                info!(log, "hypervisor type: Amazon AWS Nitro (from SMBIOS)");
+                run_amazon(log)?;
+                return Ok(());
+            }
+            _ => error!(log, "unrecognised SMBIOS information {} {} {}",
+			smbios.manufacturer.as_str(), smbios.product.as_str(),
+			smbios.version.as_str()),
         }
     }
 
