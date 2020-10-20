@@ -35,17 +35,6 @@
     <service_fmri value='svc:/milestone/devices' />
   </dependency>
 
-  <!-- The "Postboot" mechanism in OmniOS installer/image builder (Kayak)
-    schedules commands to be run in the initial-boot service.  We should
-    run after that, as it contains some critical early things like
-    regenerating the ZFS GUID and upgrading the pool.  Note that this
-    service appears to disable itself after it runs, so this must be
-    an optional dependency. -->
-  <dependency name='initial-boot' grouping='optional_all' restart_on='none'
-    type='service'>
-    <service_fmri value='svc:/system/initial-boot' />
-  </dependency>
-
   <!-- Hold the network and system configuration milestones back, in case
     we end up making changes to the IP stack, hostname, or the DNS
     configuration, etc. -->
