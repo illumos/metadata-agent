@@ -1,3 +1,6 @@
+/*
+ * Copyright 2020 Oxide Computer Company
+ */
 
 use atty::Stream;
 use slog::Drain;

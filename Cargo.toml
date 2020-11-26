@@ -1,10 +1,15 @@
 [package]
-name = "metadata"
+name = "illumos-metadata-agent"
+description = "Cloud metadata bootstrap software for illumos systems"
 version = "0.1.0"
 authors = ["Joshua M. Clulow <josh@sysmgr.org>"]
 edition = "2018"
+license = "Apache-2.0"
+repository = "https://github.com/illumos/metadata-agent"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "metadata"
+path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = [ "derive" ] }
@@ -14,7 +19,21 @@ anyhow = "1"
 slog = "2.5"
 slog-term = "2.5"
 atty = "0.2"
-#getopts = "0.2"
+
+#
+# Force an earlier version of socket2 which does not use the TCP_MAXSEG symbol
+# presently missing from the libc crate.  Can likely be removed when
+# rust-lang/libc#1984 is merged, which will add that socket option.
+#
+socket2 = "0.3, <=0.3.16"
+
+#
+# Force an earlier version of unicode-normalization in order to get a version
+# of tinyvec less than 1.0.  There is presently an issue with the compiler in
+# the stable version of Rust 1.48 on illumos; it appears to go away with
+# 1.49.0-beta.2.
+#
+unicode-normalization = "0.1, <0.1.14"
 
 [dependencies.reqwest]
 version = "0.10"

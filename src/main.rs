@@ -1,3 +1,6 @@
+/*
+ * Copyright 2020 Oxide Computer Company
+ */
 
 use std::io::Read;
 use std::io::Write;

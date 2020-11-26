@@ -1,3 +1,6 @@
+/*
+ * Copyright 2020 Oxide Computer Company
+ */
 
 use std::collections::HashMap;
 use std::io::Write;
