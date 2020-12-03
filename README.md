@@ -18,6 +18,7 @@ some level:
 * Joyent SmartOS (including Triton environments)
 * DigitalOcean
 * Amazon EC2
+* Generic QEMU/KVM; e.g., under `libvirtd`
 
 ## Building and Usage
 

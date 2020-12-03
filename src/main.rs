@@ -6,7 +6,8 @@ use std::io::Read;
 use std::io::Write;
 use std::io::ErrorKind;
 use std::collections::HashMap;
-use std::fs::{self, DirBuilder};
+use std::path::Path;
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::process::Command;
 
@@ -23,6 +24,7 @@ const METADATA_DIR: &str = "/var/metadata";
 const STAMP: &str = "/var/metadata/stamp";
 const USERSCRIPT: &str = "/var/metadata/userscript";
 const MOUNTPOINT: &str = "/var/metadata/iso";
+const UNPACKDIR: &str = "/var/metadata/files";
 
 const DEFROUTER: &str = "/etc/defaultrouter";
 
@@ -38,6 +40,7 @@ const SMBIOS: &str = "/usr/sbin/smbios";
 const SVCADM: &str = "/usr/sbin/svcadm";
 const SWAPADD: &str = "/sbin/swapadd";
 const ZFS: &str = "/sbin/zfs";
+const CPIO: &str = "/usr/bin/cpio";
 
 const FMRI_USERSCRIPT: &str = "svc:/system/illumos/userscript:default";
 
@@ -46,6 +49,7 @@ struct Smbios {
     manufacturer: String,
     product: String,
     version: String,
+    uuid: String,
 }
 
 fn amazon_metadata_getx(log: &Logger, key: &str) -> Result<Option<String>> {
@@ -134,6 +138,7 @@ fn smbios(log: &Logger) -> Result<Option<Smbios>> {
         let mut m = "".to_string();
         let mut p = "".to_string();
         let mut v = "".to_string();
+        let mut u = "".to_string();
 
         for l in String::from_utf8(output.stdout)?.lines() {
             let t: Vec<_> = l.trim()
@@ -151,11 +156,12 @@ fn smbios(log: &Logger) -> Result<Option<Smbios>> {
                 "Manufacturer" => m = val,
                 "Product" => p = val,
                 "Version" => v = val,
+                "UUID" => u = val,
                 _ => (),
             }
         }
 
-        Ok(Some(Smbios { manufacturer: m, product: p, version: v }))
+        Ok(Some(Smbios { manufacturer: m, product: p, version: v, uuid: u, }))
     }
 }
 
@@ -252,7 +258,7 @@ fn write_lines<L>(log: &Logger, p: &str, lines: &[L]) -> Result<()>
 }
 
 fn read_file(p: &str) -> Result<Option<String>> {
-    let f = match std::fs::File::open(p) {
+    let f = match File::open(p) {
         Ok(f) => f,
         Err(e) => {
             match e.kind() {
@@ -450,6 +456,16 @@ fn exists_dir(p: &str) -> Result<bool> {
     Ok(true)
 }
 
+fn ensure_dir(log: &Logger, path: &str) -> Result<()> {
+    if !exists_dir(path)? {
+        info!(log, "mkdir {}", path);
+        DirBuilder::new()
+            .mode(0o700)
+            .create(path)?;
+    }
+    Ok(())
+}
+
 fn exists_file(p: &str) -> Result<bool> {
     let md = match std::fs::metadata(p) {
         Ok(md) => md,
@@ -464,6 +480,61 @@ fn exists_file(p: &str) -> Result<bool> {
     }
 
     Ok(true)
+}
+
+fn detect_archive<P: AsRef<Path>>(rdevpath: P) -> Result<Option<String>> {
+    let mut buf = [0u8; 512];
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .append(false)
+        .truncate(false)
+        .open(rdevpath.as_ref())?;
+    f.read_exact(&mut buf)?;
+    if buf[0] == 0xC7 && buf[1] == 0x71 {
+        Ok(Some("cpio".to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn find_cpio_device(log: &Logger) -> Result<Option<String>> {
+    /*
+     * Use the raw device so that we can read just enough bytes to look for the
+     * cpio magic:
+     */
+    let i = std::fs::read_dir("/dev/rdsk")?;
+
+    let mut out = Vec::new();
+
+    for ent in i {
+        let ent = ent?;
+
+        if let Some(name) = ent.file_name().to_str() {
+            if !name.ends_with("p0") {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        match detect_archive(&ent.path()) {
+            Ok(Some(archive)) => {
+                if &archive == "cpio" {
+                    out.push(ent.path());
+                }
+            }
+            Err(e) => warn!(log, "detecting archive on {}: {:?}",
+                ent.path().display(), e),
+            _ => {}
+        }
+    }
+
+    match out.len() {
+        0 => Ok(None),
+        1 => Ok(Some(out[0].to_str().unwrap().to_string())),
+        n => bail!("found {} cpio archive devices", n),
+    }
 }
 
 fn find_device() -> Result<Option<String>> {
@@ -990,12 +1061,7 @@ fn run(log: &Logger) -> Result<()> {
         bail!("SMF_FMRI is not set; running under SMF?");
     }
 
-    if !exists_dir(METADATA_DIR)? {
-        info!(log, "mkdir {}", METADATA_DIR);
-        DirBuilder::new()
-            .mode(0o700)
-            .create(METADATA_DIR)?;
-    }
+    ensure_dir(log, METADATA_DIR)?;
 
     /*
      * First, expand the ZFS pool.  We can do this prior to metadata access.
@@ -1033,6 +1099,11 @@ fn run(log: &Logger) -> Result<()> {
                 run_amazon(log)?;
                 return Ok(());
             }
+            ("QEMU", _) => {
+                info!(log, "hypervisor type: Generic QEMU (from SMBIOS)");
+                run_qemu(log, &smbios.uuid)?;
+                return Ok(());
+            }
             _ => {}
         }
 
@@ -1056,6 +1127,108 @@ fn run(log: &Logger) -> Result<()> {
      */
     info!(log, "hypervisor type: DigitalOcean (wild guess)");
     run_digitalocean(log)?;
+    Ok(())
+}
+
+fn run_qemu(log: &Logger, smbios_uuid: &str) -> Result<()> {
+    /*
+     * Load our stamp file to see if the Guest UUID has changed.
+     */
+    if let Some([id]) = read_lines(STAMP)?.as_deref() {
+        if id.trim() == smbios_uuid {
+            info!(log, "this guest has already completed first \
+                boot processing, halting");
+            return Ok(());
+        } else {
+            info!(log, "guest UUID changed ({} -> {}), reprocessing",
+                id.trim(), smbios_uuid);
+        }
+    }
+
+    phase_reguid_zpool(log)?;
+
+    /*
+     * To ease configuration of a generic QEMU guest on a system that lacks a
+     * mechanism for guest metadata services (e.g., QEMU under libvirt on a
+     * Linux desktop) we will try to detect a disk device that contains a cpio
+     * archive with metadata files.
+     */
+    info!(log, "searching for cpio device with metadata...");
+    let dev = find_cpio_device(log)?;
+    if let Some(dev) = &dev {
+        println!("extracting cpio from {} to {}", dev, UNPACKDIR);
+        ensure_dir(log, UNPACKDIR)?;
+        let cpio = Command::new(CPIO)
+            .arg("-i")
+            .arg("-q")
+            .arg("-I").arg(&dev)
+            .current_dir(UNPACKDIR)
+            .env_clear()
+            .output()?;
+
+        if !cpio.status.success() {
+            bail!("cpio failure: {}", cpio.info());
+        }
+
+        info!(log, "ok, cpio extracted");
+    }
+
+    /*
+     * For now, we will configure one NIC with DHCP.  Virtio interfaces are
+     * preferred.
+     */
+    let ifaces = dladm_ether_list()?;
+    let mut chosen = None;
+    info!(log, "found these ethernet interfaces: {:?}", ifaces);
+    /*
+     * Prefer Virtio devices:
+     */
+    for iface in ifaces.iter() {
+        if iface.starts_with("vioif") {
+            chosen = Some(iface.as_str());
+            break;
+        }
+    }
+    /*
+     * Otherwise, use whatever we have:
+     */
+    if chosen.is_none() {
+        chosen = ifaces.iter().next().map(|x| x.as_str());
+    }
+
+    if let Some(chosen) = chosen {
+        info!(log, "chose interface {}", chosen);
+        ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
+    } else {
+        bail!("could not find an appropriate Ethernet interface!");
+    }
+
+    /*
+     * Get a system hostname from the archive, if provided:
+     */
+    let name = format!("{}/nodename", UNPACKDIR);
+    if let Some(name) = read_file(&name)? {
+        phase_set_hostname(log, &name.trim())?;
+    }
+
+    /*
+     * Get SSH public keys from the archive, if provided:
+     */
+    let keys = format!("{}/authorized_keys", UNPACKDIR);
+    if let Some(keys) = read_lines(&keys)? {
+        phase_pubkeys(log, keys.as_slice())?;
+    }
+
+    /*
+     * Get a user-provided first boot script from the archive, if provided:
+     */
+    let script = format!("{}/firstboot.sh", UNPACKDIR);
+    if let Some(script) = read_file(&script)? {
+        phase_userscript(log, &script)?;
+    }
+
+    write_lines(log, STAMP, &[smbios_uuid])?;
+
     Ok(())
 }
 
@@ -1302,12 +1475,7 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
     if do_mount {
         info!(log, "need to mount Metadata ISO");
 
-        if !exists_dir(MOUNTPOINT)? {
-            info!(log, "should do mkdir");
-            DirBuilder::new()
-                .mode(0o700)
-                .create(MOUNTPOINT)?;
-        }
+        ensure_dir(log, MOUNTPOINT)?;
 
         let dev = if let Some(dev) = find_device()? {
             dev
@@ -1638,12 +1806,7 @@ fn phase_pubkeys(log: &Logger, public_keys: &[String]) -> Result<()> {
      */
     info!(log, "checking SSH public keys...");
 
-    if !exists_dir("/root/.ssh")? {
-        info!(log, "mkdir /root/.ssh");
-        DirBuilder::new()
-            .mode(0o700)
-            .create("/root/.ssh")?;
-    }
+    ensure_dir(log, "/root/.ssh")?;
 
     let mut file = read_lines_maybe("/root/.ssh/authorized_keys")?;
     info!(log, "existing SSH public keys: {:#?}", &file);
