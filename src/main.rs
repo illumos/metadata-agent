@@ -1174,6 +1174,16 @@ fn run_qemu(log: &Logger, smbios_uuid: &str) -> Result<()> {
     }
 
     /*
+     * Get a system hostname from the archive, if provided.  Make sure to set
+     * this before engaging DHCP, so that "virsh net-dhcp-leases default" can
+     * display the hostname in the lease record instead of "unknown".
+     */
+    let name = format!("{}/nodename", UNPACKDIR);
+    if let Some(name) = read_file(&name)? {
+        phase_set_hostname(log, &name.trim())?;
+    }
+
+    /*
      * For now, we will configure one NIC with DHCP.  Virtio interfaces are
      * preferred.
      */
@@ -1201,14 +1211,6 @@ fn run_qemu(log: &Logger, smbios_uuid: &str) -> Result<()> {
         ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
     } else {
         bail!("could not find an appropriate Ethernet interface!");
-    }
-
-    /*
-     * Get a system hostname from the archive, if provided:
-     */
-    let name = format!("{}/nodename", UNPACKDIR);
-    if let Some(name) = read_file(&name)? {
-        phase_set_hostname(log, &name.trim())?;
     }
 
     /*
