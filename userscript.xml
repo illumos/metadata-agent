@@ -15,6 +15,13 @@
     <service_fmri value='svc:/system/illumos/metadata' />
   </dependency>
 
+  <!-- Run once we hit multi-user, so that the network and file systems have
+    been set up. -->
+  <dependency name='multi-user' grouping='require_all' restart_on='none'
+    type='service'>
+    <service_fmri value='svc:/milestone/multi-user' />
+  </dependency>
+
   <exec_method type='method' name='start'
     exec='/usr/lib/userscript.sh'
     timeout_seconds='3600' />
