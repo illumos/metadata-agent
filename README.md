@@ -19,6 +19,7 @@ some level:
 * DigitalOcean
 * Amazon EC2
 * Generic QEMU/KVM; e.g., under `libvirtd`
+* VMware Fusion
 
 ## Building and Usage
 

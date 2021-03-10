@@ -157,7 +157,7 @@ fn prtvtoc(disk: &str) -> Result<Vtoc> {
         WaitingForDimensions,
         Dimensions,
         After,
-    };
+    }
     let mut sectorsize: Option<u64> = None;
     let mut sectorcount: Option<u64> = None;
     let mut state = State::WaitingForDimensions;

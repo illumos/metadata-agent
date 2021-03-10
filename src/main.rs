@@ -492,6 +492,14 @@ fn detect_archive<P: AsRef<Path>>(rdevpath: P) -> Result<Option<String>> {
         .open(rdevpath.as_ref())?;
     f.read_exact(&mut buf)?;
     if buf[0] == 0xC7 && buf[1] == 0x71 {
+        /*
+         * Binary header (octal 070707)
+         */
+        Ok(Some("cpio".to_string()))
+    } else if &buf[0..6] == b"070707" {
+        /*
+         * ASCII header
+         */
         Ok(Some("cpio".to_string()))
     } else {
         Ok(None)
@@ -1101,7 +1109,12 @@ fn run(log: &Logger) -> Result<()> {
             }
             ("QEMU", _) => {
                 info!(log, "hypervisor type: Generic QEMU (from SMBIOS)");
-                run_qemu(log, &smbios.uuid)?;
+                run_generic(log, &smbios.uuid)?;
+                return Ok(());
+            }
+            ("VMware, Inc.", "VMware Virtual Platform") => {
+                info!(log, "hypervisor type: VMware (from SMBIOS)");
+                run_generic(log, &smbios.uuid)?;
                 return Ok(());
             }
             _ => {}
@@ -1130,7 +1143,7 @@ fn run(log: &Logger) -> Result<()> {
     Ok(())
 }
 
-fn run_qemu(log: &Logger, smbios_uuid: &str) -> Result<()> {
+fn run_generic(log: &Logger, smbios_uuid: &str) -> Result<()> {
     /*
      * Load our stamp file to see if the Guest UUID has changed.
      */
@@ -1148,10 +1161,10 @@ fn run_qemu(log: &Logger, smbios_uuid: &str) -> Result<()> {
     phase_reguid_zpool(log)?;
 
     /*
-     * To ease configuration of a generic QEMU guest on a system that lacks a
-     * mechanism for guest metadata services (e.g., QEMU under libvirt on a
-     * Linux desktop) we will try to detect a disk device that contains a cpio
-     * archive with metadata files.
+     * To ease configuration of a guest on a system that lacks a mechanism for
+     * guest metadata services (e.g., QEMU under libvirt on a Linux desktop or
+     * VMware Fusion on a Macintosh) we will try to detect a disk device that
+     * contains a cpio archive with metadata files.
      */
     info!(log, "searching for cpio device with metadata...");
     let dev = find_cpio_device(log)?;
