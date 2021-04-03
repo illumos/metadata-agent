@@ -21,6 +21,13 @@ some level:
 * Generic QEMU/KVM; e.g., under `libvirtd`
 * VMware Fusion
 
+The software is expected to work on at least the following illumos
+distributions:
+
+* [OmniOS](https://omnios.org/)
+* [OpenIndiana](https://www.openindiana.org/)
+* [Tribblix](http://www.tribblix.org/)
+
 ## Building and Usage
 
 This software must be built with Rust and Cargo.
