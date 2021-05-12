@@ -1107,14 +1107,23 @@ fn run(log: &Logger) -> Result<()> {
                 run_amazon(log)?;
                 return Ok(());
             }
+            ("OmniOS", "OmniOS HVM") => {
+                info!(log, "hypervisor type: OmniOS BHYVE (from SMBIOS)");
+                /*
+                 * Skip networking under OmniOS for now, until we figure out the
+                 * appropriate strategy for configuring networking in the guest.
+                 */
+                run_generic(log, &smbios.uuid, false)?;
+                return Ok(());
+            }
             ("QEMU", _) => {
                 info!(log, "hypervisor type: Generic QEMU (from SMBIOS)");
-                run_generic(log, &smbios.uuid)?;
+                run_generic(log, &smbios.uuid, true)?;
                 return Ok(());
             }
             ("VMware, Inc.", "VMware Virtual Platform") => {
                 info!(log, "hypervisor type: VMware (from SMBIOS)");
-                run_generic(log, &smbios.uuid)?;
+                run_generic(log, &smbios.uuid, true)?;
                 return Ok(());
             }
             _ => {}
@@ -1143,7 +1152,7 @@ fn run(log: &Logger) -> Result<()> {
     Ok(())
 }
 
-fn run_generic(log: &Logger, smbios_uuid: &str) -> Result<()> {
+fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<()> {
     /*
      * Load our stamp file to see if the Guest UUID has changed.
      */
@@ -1196,34 +1205,36 @@ fn run_generic(log: &Logger, smbios_uuid: &str) -> Result<()> {
         phase_set_hostname(log, &name.trim())?;
     }
 
-    /*
-     * For now, we will configure one NIC with DHCP.  Virtio interfaces are
-     * preferred.
-     */
-    let ifaces = dladm_ether_list()?;
-    let mut chosen = None;
-    info!(log, "found these ethernet interfaces: {:?}", ifaces);
-    /*
-     * Prefer Virtio devices:
-     */
-    for iface in ifaces.iter() {
-        if iface.starts_with("vioif") {
-            chosen = Some(iface.as_str());
-            break;
+    if network {
+        /*
+         * For now, we will configure one NIC with DHCP.  Virtio interfaces are
+         * preferred.
+         */
+        let ifaces = dladm_ether_list()?;
+        let mut chosen = None;
+        info!(log, "found these ethernet interfaces: {:?}", ifaces);
+        /*
+         * Prefer Virtio devices:
+         */
+        for iface in ifaces.iter() {
+            if iface.starts_with("vioif") {
+                chosen = Some(iface.as_str());
+                break;
+            }
         }
-    }
-    /*
-     * Otherwise, use whatever we have:
-     */
-    if chosen.is_none() {
-        chosen = ifaces.iter().next().map(|x| x.as_str());
-    }
+        /*
+         * Otherwise, use whatever we have:
+         */
+        if chosen.is_none() {
+            chosen = ifaces.iter().next().map(|x| x.as_str());
+        }
 
-    if let Some(chosen) = chosen {
-        info!(log, "chose interface {}", chosen);
-        ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
-    } else {
-        bail!("could not find an appropriate Ethernet interface!");
+        if let Some(chosen) = chosen {
+            info!(log, "chose interface {}", chosen);
+            ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
+        } else {
+            bail!("could not find an appropriate Ethernet interface!");
+        }
     }
 
     /*
