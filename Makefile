@@ -27,7 +27,7 @@ target/$(MODE)/metadata:
 install: build
 	mkdir -p $(DESTDIR)/usr/lib
 	mkdir -p $(DESTDIR)/lib/svc/manifest/system
-	install -m 0755 $(ADDITIONAL_INSTALL_ARGS_BIN) target/$(MODE)/metadata $(DESTDIR)/usr/lib/metadata
-	install -m 0755 $(ADDITIONAL_INSTALL_ARGS_BIN) userscript.sh $(DESTDIR)/usr/lib/userscript.sh
-	install -m 0644 $(ADDITIONAL_INSTALL_ARGS_SMF) metadata.xml $(DESTDIR)/lib/svc/manifest/system/metadata.xml
-	install -m 0644 $(ADDITIONAL_INSTALL_ARGS_SMF) userscript.xml $(DESTDIR)/lib/svc/manifest/system/userscript.xml
+	install -c $(DESTDIR)/usr/lib -m 0755 $(ADDITIONAL_INSTALL_ARGS_BIN) target/$(MODE)/metadata
+	install -c $(DESTDIR)/usr/lib -m 0755 $(ADDITIONAL_INSTALL_ARGS_BIN) userscript.sh
+	install -c $(DESTDIR)/lib/svc/manifest/system -m 0644 $(ADDITIONAL_INSTALL_ARGS_SMF) metadata.xml
+	install -c $(DESTDIR)/lib/svc/manifest/system -m 0644 $(ADDITIONAL_INSTALL_ARGS_SMF) userscript.xml
