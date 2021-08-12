@@ -30,7 +30,7 @@ distributions:
 
 ## Building and Usage
 
-This software must be built with Rust and Cargo. for convenience a Makefile is provided
+This software must be built with Rust and Cargo. For convenience a Makefile is provided
 
 ```
 $ gmake MODE=release
