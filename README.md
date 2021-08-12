@@ -30,10 +30,10 @@ distributions:
 
 ## Building and Usage
 
-This software must be built with Rust and Cargo.
+This software must be built with Rust and Cargo. for convenience a Makefile is provided
 
 ```
-$ cargo build --release
+$ gmake MODE=release
 ```
 
 The built artefact, `target/release/metadata`, is intended to be installed as
@@ -45,8 +45,23 @@ for both the metadata service (`metadata.xml`) and the service which executes a
 user-provided script (`userscript.xml`), and are intended to be included in the
 image in `/lib/svc/manifest/system`.
 
+The Makefile automates this aswell if wanted
+```
+$ gmake install MODE=release
+```
+
 It is desirable to include these services in the SMF seed repository for an
 image so that they are already imported when the image first boots in the
 guest.  The services include dependent relationships with several early boot
 networking and identity services in an attempt to ensure the metadata agent
 runs before network services are completely online.
+
+## Packaging
+If you would like to package this binary use the following command in your build
+system to create a prototype directory tree.
+
+`proto` can be any directory path of your choosing. 
+
+```
+$ gmake DESTDIR=proto
+```
