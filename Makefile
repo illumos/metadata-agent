@@ -3,7 +3,7 @@ USER=root
 BIN_GROUP=bin
 SYS_GROUP=sys
 
-.PHONY: all
+.PHONY: all build install
 
 # Convenience magic so packagers don't accidentally package debug builds
 ifdef DESTDIR

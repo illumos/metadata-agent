@@ -2,7 +2,7 @@
 name = "illumos-metadata-agent"
 description = "Cloud metadata bootstrap software for illumos systems"
 version = "0.1.0"
-authors = ["Joshua M. Clulow <josh@sysmgr.org>"]
+authors = ["Joshua M. Clulow <josh@sysmgr.org>", "Till Wegmueller <toasterson@gmail.com>"]
 edition = "2018"
 license = "Apache-2.0"
 repository = "https://github.com/illumos/metadata-agent"
@@ -14,11 +14,19 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = [ "derive" ] }
 serde_json = "1"
+serde_yaml = "0.8"
 tempfile = "3"
 anyhow = "1"
 slog = "2.5"
 slog-term = "2.5"
 atty = "0.2"
+failure = "0.1"
+failure_derive = "0.1"
+flate2 = "1.0"
+mailparse = "0.13.5"
+users = { version="0.11.0", optional=true }
+base64 = "0.13.0"
+libc = { version="0.2.15", optional=true }
 
 #
 # Force an earlier version of socket2 which does not use the TCP_MAXSEG symbol
@@ -39,3 +47,8 @@ unicode-normalization = "0.1, <0.1.14"
 version = "0.10"
 default-features = false
 features = ["blocking", "json"]
+
+[features]
+default = [ "cmd_users" ]
+libc_users = ["users", "libc"]
+cmd_users = []

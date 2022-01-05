@@ -1,0 +1,26 @@
+#cloud-config
+
+users:
+  - name: kablub
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - "ssh-rsa AAAAB3NzaC1yc2EAAAABJQAAAQskajdaldnalsdnalkdnalkddjfndjkndj contact@openflowlabs.com"
+    groups: [admin]
+    passwd: "$6$rounds=4096$MYetu.69Z$sfdfsdfsdfsdfsdfsfsdfsdfsdf"
+    lock_passwd: false
+    shell: "/usr/bin/bash"
+  - name: foobar
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - "ssh-rsa AAAAB3NzaC1yc2EAAAABJQAAAQskajdaldnalsdnalkdnalkddjfndjkndj contact@openflowlabs.com"
+    groups: [admin]
+    passwd: "$6$rounds=4096$MYetu.69Z$sfdfsdfsdfsdfsdfsfsdfsdfsdf"
+    lock_passwd: false
+    shell: "/usr/bin/bash"
+
+package_update: true
+package_upgrade: true
+
+growpart:
+  mode: auto
+  devices: ['/']

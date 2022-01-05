@@ -1,24 +1,47 @@
 /*
  * Copyright 2020 Oxide Computer Company
+ * Copyright 2021 OpenFlowLabs
+ *
  */
 
-use std::io::Read;
-use std::io::Write;
-use std::io::ErrorKind;
-use std::collections::HashMap;
-use std::path::Path;
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::process::Command;
-
-use serde::Deserialize;
-
-use std::net::Ipv4Addr;
+#[cfg(target_os="illumos")]
+use std::os::unix::fs::MetadataExt;
+#[cfg(target_os="linux")]
+use std::os::linux::fs::MetadataExt;
+use std::os::unix::ffi::OsStrExt;
 
 mod zpool;
 mod common;
-use common::*;
+mod userdata;
+mod users;
+mod public_keys;
+mod file;
 
+use std::collections::HashMap;
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::prelude::*;
+use std::io::{ErrorKind, BufReader, BufRead, copy as IOCopy, Read, Write};
+use std::net::Ipv4Addr;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Command};
+use userdata::read_user_data;
+use flate2::read::GzDecoder;
+use base64::{decode as base64Decode};
+use libc::{self, gid_t, uid_t};
+use std::ffi::CString;
+use std::io::Error as IOError;
+use std::io::Result as IOResult;
+
+use serde::Deserialize;
+
+use common::*;
+use file::*;
+use crate::users::*;
+use crate::userdata::networkconfig::{NetworkDataV1Iface, NetworkDataV1Subnet};
+use crate::userdata::UserData;
+use crate::userdata::cloudconfig::{UserConfig, WriteFileEncoding, WriteFileData};
+use crate::userdata::multiformat_deserialize::Multiformat;
 
 const METADATA_DIR: &str = "/var/metadata";
 const STAMP: &str = "/var/metadata/stamp";
@@ -41,6 +64,7 @@ const SVCADM: &str = "/usr/sbin/svcadm";
 const SWAPADD: &str = "/sbin/swapadd";
 const ZFS: &str = "/sbin/zfs";
 const CPIO: &str = "/usr/bin/cpio";
+const PKG: &str = "/usr/bin/pkg";
 
 const FMRI_USERSCRIPT: &str = "svc:/system/illumos/userscript:default";
 
@@ -52,7 +76,7 @@ struct Smbios {
     uuid: String,
 }
 
-fn amazon_metadata_getx(log: &Logger, key: &str) -> Result<Option<String>> {
+fn amazon_metadata_getx(log: &Logger, key: &str) -> Result<Option<String>, failure::Error> {
     let url = format!("http://169.254.169.254/latest/{}", key);
 
     let cb = reqwest::blocking::ClientBuilder::new()
@@ -80,11 +104,11 @@ fn amazon_metadata_getx(log: &Logger, key: &str) -> Result<Option<String>> {
     }
 }
 
-fn amazon_metadata_get(log: &Logger, key: &str) -> Result<Option<String>> {
+fn amazon_metadata_get(log: &Logger, key: &str) -> Result<Option<String>, failure::Error> {
     amazon_metadata_getx(log, &format!("meta-data/{}", key))
 }
 
-fn smf_enable(log: &Logger, fmri: &str) -> Result<()> {
+fn smf_enable(log: &Logger, fmri: &str) -> Result<(), failure::Error> {
     info!(log, "exec: svcadm enable {}", fmri);
     let output = Command::new(SVCADM)
         .env_clear()
@@ -99,7 +123,7 @@ fn smf_enable(log: &Logger, fmri: &str) -> Result<()> {
     Ok(())
 }
 
-fn dhcpinfo(log: &Logger, key: &str) -> Result<Option<String>> {
+fn dhcpinfo(log: &Logger, key: &str) -> Result<Option<String>, failure::Error> {
     info!(log, "exec: dhcpinfo {}", key);
     let output = Command::new(DHCPINFO)
         .env_clear()
@@ -119,7 +143,7 @@ fn dhcpinfo(log: &Logger, key: &str) -> Result<Option<String>> {
     }
 }
 
-fn smbios(log: &Logger) -> Result<Option<Smbios>> {
+fn smbios(log: &Logger) -> Result<Option<Smbios>, failure::Error> {
     info!(log, "exec: smbios -t 1");
     let output = Command::new(SMBIOS)
         .env_clear()
@@ -171,7 +195,7 @@ enum Mdata {
     WrongHypervisor,
 }
 
-fn mdata_get(log: &Logger, key: &str) -> Result<Mdata> {
+fn mdata_get(log: &Logger, key: &str) -> Result<Mdata, failure::Error> {
     info!(log, "mdata-get \"{}\"...", key);
     let output = Command::new(MDATA_GET)
         .env_clear()
@@ -203,7 +227,7 @@ fn mdata_get(log: &Logger, key: &str) -> Result<Mdata> {
     })
 }
 
-fn mdata_probe(log: &Logger) -> Result<bool> {
+fn mdata_probe(log: &Logger) -> Result<bool, failure::Error> {
     /*
      * Check for an mdata-get(1M) binary on this system:
      */
@@ -234,59 +258,7 @@ fn mdata_probe(log: &Logger) -> Result<bool> {
     }
 }
 
-pub fn write_file(p: &str, data: &str) -> Result<()> {
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(p)?;
-    let mut w = std::io::BufWriter::new(f);
-    w.write_all(data.as_bytes())?;
-    Ok(())
-}
-
-fn write_lines<L>(log: &Logger, p: &str, lines: &[L]) -> Result<()>
-    where L: AsRef<str> + std::fmt::Debug
-{
-    info!(log, "----- WRITE FILE: {} ------ {:#?}", p, lines);
-    let mut out = String::new();
-    for l in lines {
-        out.push_str(l.as_ref());
-        out.push_str("\n");
-    }
-    write_file(p, &out)
-}
-
-fn read_file(p: &str) -> Result<Option<String>> {
-    let f = match File::open(p) {
-        Ok(f) => f,
-        Err(e) => {
-            match e.kind() {
-                std::io::ErrorKind::NotFound => return Ok(None),
-                _ => bail!("open \"{}\": {}", p, e),
-            };
-        }
-    };
-    let mut r = std::io::BufReader::new(f);
-    let mut out = String::new();
-    r.read_to_string(&mut out)?;
-    Ok(Some(out))
-}
-
-fn read_lines(p: &str) -> Result<Option<Vec<String>>> {
-    Ok(read_file(p)?.map(|data| {
-        data.lines().map(|a| a.trim().to_string()).collect()
-    }))
-}
-
-fn read_lines_maybe(p: &str) -> Result<Vec<String>> {
-    Ok(match read_lines(p)? {
-        None => Vec::new(),
-        Some(l) => l,
-    })
-}
-
-fn read_json<T>(p: &str) -> Result<Option<T>>
+fn read_json<T>(p: &str) -> Result<Option<T>, failure::Error>
 where for<'de> T: Deserialize<'de>
 {
     let s = read_file(p)?;
@@ -329,7 +301,7 @@ struct IPv4 {
 }
 
 impl IPv4 {
-    fn prefix_len(&self) -> Result<u32> {
+    fn prefix_len(&self) -> Result<u32, failure::Error> {
         let nm: Ipv4Addr = self.netmask.parse()?;
         let bits: u32 = nm.into();
 
@@ -346,7 +318,7 @@ impl IPv4 {
         Ok(len)
     }
 
-    fn cidr(&self) -> Result<String> {
+    fn cidr(&self) -> Result<String, failure::Error> {
         let prefix_len = self.prefix_len()?;
         Ok(format!("{}/{}", self.ip_address, prefix_len))
     }
@@ -368,7 +340,7 @@ struct Interfaces {
 }
 
 #[derive(Debug,Deserialize)]
-struct Metadata {
+struct DOMetadata {
     auth_key: String,
     dns: DNS,
     droplet_id: u64,
@@ -404,7 +376,7 @@ impl SdcNic {
  * a dictionary as there may be more than one mount entry for a particular mount
  * point.
  */
-fn mounts() -> Result<Vec<Mount>> {
+fn mounts() -> Result<Vec<Mount>, failure::Error> {
     let mnttab = read_lines("/etc/mnttab")?.unwrap();
     let rows: Vec<Vec<_>> = mnttab.iter()
         .map(|m| { m.split('\t').collect() })
@@ -440,49 +412,7 @@ fn mounts() -> Result<Vec<Mount>> {
     Ok(out)
 }
 
-fn exists_dir(p: &str) -> Result<bool> {
-    let md = match std::fs::metadata(p) {
-        Ok(md) => md,
-        Err(e) => match e.kind() {
-            ErrorKind::NotFound => return Ok(false),
-            _ => bail!("checking {}: {}", p, e),
-        },
-    };
-
-    if !md.is_dir() {
-        bail!("\"{}\" exists but is not a directory", p);
-    }
-
-    Ok(true)
-}
-
-fn ensure_dir(log: &Logger, path: &str) -> Result<()> {
-    if !exists_dir(path)? {
-        info!(log, "mkdir {}", path);
-        DirBuilder::new()
-            .mode(0o700)
-            .create(path)?;
-    }
-    Ok(())
-}
-
-fn exists_file(p: &str) -> Result<bool> {
-    let md = match std::fs::metadata(p) {
-        Ok(md) => md,
-        Err(e) => match e.kind() {
-            ErrorKind::NotFound => return Ok(false),
-            _ => bail!("checking {}: {}", p, e),
-        },
-    };
-
-    if !md.is_file() {
-        bail!("\"{}\" exists but is not a file", p);
-    }
-
-    Ok(true)
-}
-
-fn detect_archive<P: AsRef<Path>>(rdevpath: P) -> Result<Option<String>> {
+fn detect_archive<P: AsRef<Path>>(rdevpath: P) -> Result<Option<String>, failure::Error> {
     let mut buf = [0u8; 512];
     let mut f = OpenOptions::new()
         .read(true)
@@ -506,7 +436,7 @@ fn detect_archive<P: AsRef<Path>>(rdevpath: P) -> Result<Option<String>> {
     }
 }
 
-fn find_cpio_device(log: &Logger) -> Result<Option<String>> {
+fn find_cpio_device(log: &Logger) -> Result<Option<String>, failure::Error> {
     /*
      * Use the raw device so that we can read just enough bytes to look for the
      * cpio magic:
@@ -545,7 +475,75 @@ fn find_cpio_device(log: &Logger) -> Result<Option<String>> {
     }
 }
 
-fn find_device() -> Result<Option<String>> {
+#[derive(Debug, Default, Clone)]
+struct CiDataDevice {
+    fstype: String,
+    path: String,
+    label: String,
+}
+
+fn find_cidata_devices(log: &Logger) -> Result<Option<Vec<CiDataDevice>>, failure::Error> {
+    let i = std::fs::read_dir("/dev/dsk")?;
+
+    let mut out: Vec<CiDataDevice> = Vec::new();
+
+    for ent in i {
+        let ent = ent?;
+
+        if let Some(name) = ent.file_name().to_str() {
+            if !name.ends_with("p0") && !name.ends_with("s0") {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        /*
+         * Determine which type of file system resides on the device:
+         */
+        let output = Command::new(FSTYP)
+            .env_clear()
+            .arg("-a")
+            .arg(ent.path())
+            .output()?;
+
+        if !output.status.success() {
+            continue;
+        }
+
+
+        let mut dev = CiDataDevice::default();
+        dev.path = ent.path().to_str().unwrap().to_string();
+        let mut count = 0;
+        for line_result in BufReader::new(output.stdout.as_slice()).lines() {
+            if let Ok(line) = line_result {
+                if count == 0 {
+                    dev.fstype = line.trim().to_lowercase().clone();
+                }
+                if line.contains(":") {
+                    if let Some((key, value)) = line.split_once(":") {
+                        if key.trim().to_lowercase() == "volume_label" {
+                            let label = value.replace("'", "").trim().to_lowercase();
+                            if label == "cidata" {
+                                dev.label = label;
+                                debug!(log, "found cidata device {} of type {}", &dev.path, &dev.fstype);
+                                out.push(dev.clone());
+                            }
+                        }
+                    }
+                }
+                count += 1;
+            }
+        }
+    }
+
+    match out.len() {
+        0 => Ok(None),
+        _ => Ok(Some(out)),
+    }
+}
+
+fn find_device() -> Result<Option<String>, failure::Error> {
     let i = std::fs::read_dir("/dev/dsk")?;
 
     let mut out = Vec::new();
@@ -554,7 +552,7 @@ fn find_device() -> Result<Option<String>> {
         let ent = ent?;
 
         if let Some(name) = ent.file_name().to_str() {
-            if !name.ends_with("p0") {
+            if !name.ends_with("p0") && !name.ends_with("s0") {
                 continue;
             }
         } else {
@@ -575,6 +573,9 @@ fn find_device() -> Result<Option<String>> {
 
         if let Ok(s) = String::from_utf8(output.stdout) {
             if s.trim() == "hsfs" {
+                out.push(ent.path());
+            }
+            if s.trim() == "pcfs" {
                 out.push(ent.path());
             }
         }
@@ -620,7 +621,7 @@ impl Terms {
     }
 }
 
-fn parse_net_adm(stdout: Vec<u8>) -> Result<Vec<Vec<String>>> {
+fn parse_net_adm(stdout: Vec<u8>) -> Result<Vec<Vec<String>>, failure::Error> {
     let stdout = String::from_utf8(stdout)?;
     let mut out = Vec::new();
 
@@ -648,7 +649,67 @@ fn parse_net_adm(stdout: Vec<u8>) -> Result<Vec<Vec<String>>> {
     Ok(out)
 }
 
-fn ipadm_interface_list() -> Result<Vec<String>> {
+fn netmask_to_cidr(netmask: &Option<String>) -> Result<u8, failure::Error> {
+    match netmask {
+        None => Ok(24),
+        Some(mask) => {
+            let mask_parsed: Ipv4Addr = mask.parse()?;
+            let octects = mask_parsed.octets();
+            if octects[0] != 255 {
+                match octects[0] {
+                    128 => Ok(1),
+                    192 => Ok(2),
+                    224 => Ok(3),
+                    240 => Ok(4),
+                    248 => Ok(5),
+                    252 => Ok(6),
+                    254 => Ok(7),
+                    _ => bail!("invalid netmask: {}", mask)
+                }
+            } else if octects[1] != 255 {
+                match octects[1] {
+                    0 => Ok(8),
+                    128 => Ok(9),
+                    192 => Ok(10),
+                    224 => Ok(11),
+                    240 => Ok(12),
+                    248 => Ok(13),
+                    252 => Ok(14),
+                    254 => Ok(15),
+                    _ => bail!("invalid netmask: {}", mask)
+                }
+            } else if octects[2] != 255 {
+                match octects[2] {
+                    0 => Ok(16),
+                    128 => Ok(17),
+                    192 => Ok(18),
+                    224 => Ok(19),
+                    240 => Ok(20),
+                    248 => Ok(21),
+                    252 => Ok(22),
+                    254 => Ok(23),
+                    _ => bail!("invalid netmask: {}", mask)
+                }
+            } else if octects[3] != 255 {
+                match octects[3] {
+                    0 => Ok(24),
+                    128 => Ok(25),
+                    192 => Ok(26),
+                    224 => Ok(27),
+                    240 => Ok(28),
+                    248 => Ok(29),
+                    252 => Ok(30),
+                    254 => Ok(31),
+                    _ => bail!("invalid netmask: {}", mask)
+                }
+            } else {
+                Ok(32)
+            }
+        }
+    }
+}
+
+fn ipadm_interface_list() -> Result<Vec<String>, failure::Error> {
     let output = Command::new(IPADM)
         .env_clear()
         .arg("show-if")
@@ -673,7 +734,7 @@ struct IpadmAddress {
     cidr: String,
 }
 
-fn ipadm_address_list() -> Result<Vec<IpadmAddress>> {
+fn ipadm_address_list() -> Result<Vec<IpadmAddress>, failure::Error> {
     let output = Command::new(IPADM)
         .env_clear()
         .arg("show-addr")
@@ -720,7 +781,7 @@ fn mac_sanitise(input: &str) -> String {
     mac
 }
 
-fn dladm_ether_list() -> Result<Vec<String>> {
+fn dladm_ether_list() -> Result<Vec<String>, failure::Error> {
     let output = Command::new(DLADM)
         .env_clear()
         .arg("show-ether")
@@ -736,7 +797,7 @@ fn dladm_ether_list() -> Result<Vec<String>> {
     Ok(ents.iter().map(|l| l[0].trim().to_string()).collect())
 }
 
-fn mac_to_nic(mac: &str) -> Result<Option<String>> {
+fn mac_to_nic(mac: &str) -> Result<Option<String>, failure::Error> {
     let output = Command::new(DLADM)
         .env_clear()
         .arg("show-phys")
@@ -768,7 +829,7 @@ fn mac_to_nic(mac: &str) -> Result<Option<String>> {
     }
 }
 
-fn memsize() -> Result<u64> {
+fn memsize() -> Result<u64, failure::Error> {
     let output = std::process::Command::new(PRTCONF)
         .env_clear()
         .arg("-m")
@@ -781,7 +842,7 @@ fn memsize() -> Result<u64> {
     Ok(String::from_utf8(output.stdout)?.trim().parse()?)
 }
 
-fn create_zvol(name: &str, size_mib: u64) -> Result<()> {
+fn create_zvol(name: &str, size_mib: u64) -> Result<(), failure::Error> {
     let output = std::process::Command::new(ZFS)
         .env_clear()
         .arg("create")
@@ -796,7 +857,7 @@ fn create_zvol(name: &str, size_mib: u64) -> Result<()> {
     Ok(())
 }
 
-fn exists_zvol(name: &str) -> Result<bool> {
+fn exists_zvol(name: &str) -> Result<bool, failure::Error> {
     let output = std::process::Command::new(ZFS)
         .env_clear()
         .arg("list")
@@ -827,7 +888,7 @@ fn exists_zvol(name: &str) -> Result<bool> {
     Ok(false)
 }
 
-fn swapadd() -> Result<()> {
+fn swapadd() -> Result<(), failure::Error> {
     let output = std::process::Command::new(SWAPADD)
         .env_clear()
         .output()?;
@@ -839,7 +900,113 @@ fn swapadd() -> Result<()> {
     Ok(())
 }
 
-fn ensure_ipadm_interface(log: &Logger, n: &str) -> Result<bool> {
+fn ensure_interface_name(log: &Logger, name: &str, mac_addres: &str) -> Result<(), failure::Error> {
+    // First lets get the nic and check if we need to run.
+    let nic = mac_to_nic(mac_addres)?;
+    match nic {
+        Some(iface) => {
+            info!(log, "interface {} with mac {} found", &iface, mac_addres);
+            // Rename the link if the current name is not what we expect
+            if &iface != name {
+                info!(log, "renaming link {} -> {}", &iface, name);
+                let output = Command::new(DLADM)
+                    .env_clear()
+                    .arg("rename-link")
+                    .arg(iface)
+                    .arg(name)
+                    .output()?;
+                if !output.status.success() {
+                    bail!("dladm rename-link returned an error: {}", output.info());
+                }
+            }
+        }
+        None => {
+            bail!("could not find a nic with mac {}", mac_addres);
+        }
+    };
+
+    Ok(())
+}
+
+fn ensure_ipadm_subnets_config(log: &Logger, link_name: &str, subnets: &Vec<NetworkDataV1Subnet>) -> Result<(), failure::Error> {
+    info!(log, "configuring subnets for link {}", link_name);
+    for subnet in subnets {
+        if let Err(e) = ensure_ipadm_single_subnet_config(log, link_name, subnet) {
+            error!(log, "error while configuring link {}: {}", link_name, e)
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_ipadm_single_subnet_config(log: &Logger, link_name: &str, subnet: &NetworkDataV1Subnet) -> Result<(), failure::Error> {
+    match subnet {
+        NetworkDataV1Subnet::Dhcp4 | NetworkDataV1Subnet::Dhcp => {
+            ensure_ipv4_interface_dhcp(log, "dhcp4", link_name)
+        }
+        NetworkDataV1Subnet::Dhcp6 | NetworkDataV1Subnet::Dhcpv6Stateful => {
+            bail!("ipv6 is not implemented yet")
+        }
+        NetworkDataV1Subnet::Static(conf) => {
+            if let Some(_) = &conf.netmask {
+                let address = format!("{}/{}", conf.address, netmask_to_cidr(&conf.netmask)?);
+                ensure_ipv4_interface(log, "ipv4", None, Some(link_name), &address)?;
+            } else {
+                let address = if !conf.address.contains("/") {
+                    format!("{}/24", conf.address)
+                } else {
+                    conf.address.clone()
+                };
+                ensure_ipv4_interface(log, "ipv4", None, Some(link_name), &address)?;
+            }
+
+            if let Some(gw) = &conf.gateway {
+                ensure_ipv4_gateway(log, gw)?;
+            }
+
+            if let Some(dns_servers) = &conf.dns_nameservers {
+                ensure_dns_nameservers(log, dns_servers)?;
+            }
+
+            if let Some(dns_search) = &conf.dns_search {
+                ensure_dns_search(log, dns_search)?;
+            }
+
+            if let Some(routes) = &conf.routes {
+                error!(log, "route configuration not yet wupported, cannot apply {:#?} to link {}", routes, link_name);
+            }
+
+            Ok(())
+        }
+        NetworkDataV1Subnet::Static6(_) => {
+            bail!("ipv6 is not implemented yet")
+        }
+        NetworkDataV1Subnet::Dhcpv6Stateless => {
+            bail!("ipv6 is not implemented yet")
+        }
+        NetworkDataV1Subnet::SLAAC { .. } => {
+            bail!("ipv6 is not implemented yet")
+        }
+    }
+}
+
+fn ensure_interface_mtu(log: &Logger, name: &str, mtu: &i32) -> Result<(), failure::Error> {
+    info!(log, "setting mtu of interface {} to {}", name, mtu);
+    let output = Command::new(DLADM)
+        .env_clear()
+        .arg("set-linkprop")
+        .arg("-p")
+        .arg(format!("mtu={}", mtu))
+        .arg(name)
+        .output()?;
+    if !output.status.success() {
+        bail!("dladm setting mtu failed: {}", output.info());
+    }
+
+    Ok(())
+}
+
+fn ensure_ipadm_interface(log: &Logger, n: &str) -> Result<bool, failure::Error> {
     info!(log, "ENSURE INTERFACE: {}", n);
 
     let ifaces = ipadm_interface_list()?;
@@ -864,7 +1031,7 @@ fn ensure_ipadm_interface(log: &Logger, n: &str) -> Result<bool> {
     }
 }
 
-fn ensure_ipv4_gateway(log: &Logger, gateway: &str) -> Result<()> {
+fn ensure_ipv4_gateway(log: &Logger, gateway: &str) -> Result<(), failure::Error> {
     info!(log, "ENSURE IPv4 GATEWAY: {}", gateway);
 
     let orig_defrouters = read_lines_maybe(DEFROUTER)?;
@@ -898,7 +1065,7 @@ fn ensure_ipv4_gateway(log: &Logger, gateway: &str) -> Result<()> {
 }
 
 fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str)
-    -> Result<()>
+    -> Result<(), failure::Error>
 {
     info!(log, "ENSURE IPv4 DHCP INTERFACE: {}", n);
 
@@ -976,22 +1143,31 @@ fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str)
     }
 }
 
-fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &str)
-    -> Result<()>
+fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac_option: Option<&str>, link_name: Option<&str>, ipv4: &str)
+    -> Result<(), failure::Error>
 {
-    info!(log, "ENSURE IPv4 INTERFACE: {}, {:?}", mac, ipv4);
 
-    let n = match mac_to_nic(mac)? {
-        None => bail!("MAC address {} not found", mac),
-        Some(n) => n,
+    let found_nic = if let Some(mac) = mac_option {
+        match mac_to_nic(mac)? {
+            None => bail!("MAC address {} not found", mac),
+            Some(n) => {
+                info!(log, "MAC address {} is NIC {}", mac, n);
+                n
+            },
+        }
+    } else if let Some(name) = link_name {
+        String::from(name)
+    } else {
+        panic!("programmer error: either link_name or mac_address must be passed to this function got none of both");
     };
-    info!(log, "MAC address {} is NIC {}", mac, n);
 
-    ensure_ipadm_interface(log, &n)?;
+    info!(log, "ENSURE IPv4 INTERFACE: {}, {:?}", found_nic, ipv4);
+
+    ensure_ipadm_interface(log, &found_nic)?;
 
     info!(log, "target IP address: {}", ipv4);
 
-    let targname = format!("{}/{}", n, sfx);
+    let targname = format!("{}/{}", found_nic, sfx);
     info!(log, "target IP name: {}", targname);
 
     let addrs = ipadm_address_list()?;
@@ -1039,7 +1215,7 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac: &str, ipv4: &str)
         }
     }
 
-    info!(log, "ok, interface {} address {} ({}) complete", n, ipv4, sfx);
+    info!(log, "ok, interface {} address {} ({}) complete", found_nic, ipv4, sfx);
     Ok(())
 }
 
@@ -1058,7 +1234,7 @@ fn main() {
     }
 }
 
-fn run(log: &Logger) -> Result<()> {
+fn run(log: &Logger) -> Result<(), failure::Error> {
     /*
      * This program could be destructive if run in the wrong place.  Try to
      * ensure it has at least been installed as an SMF service:
@@ -1107,13 +1283,13 @@ fn run(log: &Logger) -> Result<()> {
                 run_amazon(log)?;
                 return Ok(());
             }
-            ("OmniOS", "OmniOS HVM") => {
-                info!(log, "hypervisor type: OmniOS BHYVE (from SMBIOS)");
+            ("OmniOS", "OmniOS HVM") | ("OpenIndiana", "OpenIndiana HVM") => {
+                info!(log, "hypervisor type: illumos BHYVE (from SMBIOS)");
                 /*
                  * Skip networking under OmniOS for now, until we figure out the
                  * appropriate strategy for configuring networking in the guest.
                  */
-                run_generic(log, &smbios.uuid, false)?;
+                run_illumos(log, &smbios.uuid)?;
                 return Ok(());
             }
             ("QEMU", _) => {
@@ -1152,7 +1328,7 @@ fn run(log: &Logger) -> Result<()> {
     Ok(())
 }
 
-fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<()> {
+fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<(), failure::Error> {
     /*
      * Load our stamp file to see if the Guest UUID has changed.
      */
@@ -1242,7 +1418,7 @@ fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<()> {
      */
     let keys = format!("{}/authorized_keys", UNPACKDIR);
     if let Some(keys) = read_lines(&keys)? {
-        phase_pubkeys(log, keys.as_slice())?;
+        ensure_pubkeys(log, "root",keys.as_slice())?;
     }
 
     /*
@@ -1258,7 +1434,227 @@ fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_amazon(log: &Logger) -> Result<()> {
+#[derive(Default)]
+struct SMBIOSDatasource {
+    uuid: String,
+    datasource: String,
+    seed_from: String,
+    local_hostname: String,
+}
+
+fn parse_smbios_datasource_string(raw_string: &str) -> Result<SMBIOSDatasource, failure::Error> {
+    let mut ds = SMBIOSDatasource::default();
+    for part in raw_string.split(";") {
+        let key_val: Vec<&str> = part.split("=").collect();
+        match key_val[0] {
+            "ds" => ds.datasource = String::from(key_val[1]),
+            "i" | "instance-id" => ds.uuid = String::from(key_val[1]),
+            "s" | "seedfrom" => ds.seed_from = String::from(key_val[1]),
+            "h" | "local-hostname" => ds.local_hostname = String::from(key_val[1]),
+            _ => {}
+        }
+    }
+
+    Ok(ds)
+}
+
+fn ensure_network_config(log: &Logger, config: &userdata::networkconfig::NetworkConfig) -> Result<(), failure::Error> {
+    let net_config = match config {
+        userdata::networkconfig::NetworkConfig::V1(c) => &c.config,
+        userdata::networkconfig::NetworkConfig::V2(_) => {
+            error!(log, "Network config v2 not supported yet");
+            bail!("Network Config v2 not supported");
+        }
+    };
+
+    // First configure the Physical Interfaces
+    for iface_config in net_config {
+        match iface_config {
+            NetworkDataV1Iface::Physical { name, mac_address: mac_address_option, mtu: mtu_option, subnets: subnet_option } => {
+                // First we make sure the Interface is named correctly
+                // if we have a mac address set. Thus making
+                // the optional mac address attribute the
+                // attribute to identify the nic
+                // not providing a mac address thus results in the name
+                // being the identifying attribute
+                if let Some(mac_addr) = mac_address_option {
+                    info!(log, "ensuring nic with mac {} is named {}", mac_addr, name);
+                    ensure_interface_name(log, name, &mac_addr)?;
+                }
+
+                if let Some(mtu) = mtu_option {
+                    ensure_interface_mtu(log, name, mtu)?;
+                }
+
+                if let Some(subnets) = subnet_option {
+                    ensure_ipadm_subnets_config(log, name, subnets)?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // On the Second pass configure the combined ineterfaces (Bond, Bridge, VLAN...)
+    for iface_config in net_config {
+        match iface_config {
+            NetworkDataV1Iface::Bond { .. } => {
+                bail!("bonds not yet supported")
+            }
+            NetworkDataV1Iface::Bridge { .. } => {
+                bail!("bridges not yet supported")
+            }
+            NetworkDataV1Iface::Vlan { .. } => {
+                bail!("vlans not yet supported")
+            }
+            _ => {}
+        }
+    }
+
+    //Configure Routes
+    for iface_config in net_config {
+        match iface_config {
+            NetworkDataV1Iface::Route {..} => {
+                bail!("routes not yet supported")
+            }
+            _ => {}
+        }
+    }
+
+    //Finaly configure nameservers
+    for iface_config in net_config {
+        match iface_config {
+            NetworkDataV1Iface::Nameserver { address, search, .. } => {
+                ensure_dns_nameservers(log, address)?;
+                ensure_dns_search(log, search)?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn run_illumos(log: &Logger, smbios_raw_string: &str) -> Result<(), failure::Error> {
+    /*
+     * Parse any datasource definition from smbios_uuid field, which by cloud-init standard is
+     * not just the uuid
+     */
+    let ds = parse_smbios_datasource_string(smbios_raw_string)?;
+
+    /*
+     * Load our stamp file to see if the Guest UUID has changed.
+     */
+    if let Some([id]) = read_lines(STAMP)?.as_deref() {
+        if id.trim() == ds.uuid {
+            info!(log, "this guest has already completed first \
+                boot processing, halting");
+            return Ok(());
+        } else {
+            info!(log, "guest UUID changed ({} -> {}), reprocessing",
+                id.trim(), ds.uuid);
+        }
+    }
+
+    phase_reguid_zpool(log)?;
+
+    /*
+     * The meta-data and user-data can be provided via a vfat (pcfs) or iso9660 (hsfs)
+     *
+     */
+    info!(log, "searching for cidata device with metadata...");
+    let devs_opt = find_cidata_devices(log)?;
+    if let Some(devs) = devs_opt {
+        for dev in devs {
+            info!(log, "mounting cidata device {} to {}", dev.path, UNPACKDIR);
+            ensure_dir(log, UNPACKDIR)?;
+            let mount = Command::new(MOUNT)
+                .arg("-F").arg(&dev.fstype)
+                .arg(&dev.path)
+                .arg(UNPACKDIR)
+                .env_clear()
+                .output()?;
+
+            if !mount.status.success() {
+                bail!("mount failure: {}", mount.info());
+            }
+
+            info!(log, "ok, disk mounted");
+
+        }
+    } else {
+        bail!("could not find a cidata device bailing")
+    }
+
+    let dir_buf = PathBuf::from(UNPACKDIR);
+
+    let user_data = read_user_data(log, &dir_buf.join("user-data"))?;
+
+    let meta_data_file = File::open(&dir_buf.join("meta-data"))?;
+    let meta_data = serde_yaml::from_reader::<File, userdata::cloudconfig::Metadata>(meta_data_file)?;
+
+
+    /*
+     * Get a system hostname from the metadata, if provided.  Make sure to set
+     * this before engaging DHCP, so that "virsh net-dhcp-leases default" can
+     * display the hostname in the lease record instead of "unknown".
+     */
+    phase_set_hostname(log, meta_data.get_hostname())?;
+
+    let network_config_result = userdata::networkconfig::parse_network_config( &dir_buf.join("network-config"));
+    // Apply network config if we have one.
+    if network_config_result.is_ok() {
+        ensure_network_config(&log, &network_config_result?)?;
+    } else {
+        /*
+         * If we have no network config try DHCP.  Virtio interfaces are
+         * preferred.
+         */
+        let ifaces = dladm_ether_list()?;
+        let mut chosen = None;
+        info!(log, "found these ethernet interfaces: {:?}", ifaces);
+        /*
+         * Prefer Virtio devices:
+         */
+        for iface in ifaces.iter() {
+            if iface.starts_with("vioif") {
+                chosen = Some(iface.as_str());
+                break;
+            }
+        }
+        /*
+         * Otherwise, use whatever we have:
+         */
+        if chosen.is_none() {
+            chosen = ifaces.iter().next().map(|x| x.as_str());
+        }
+
+        if let Some(chosen) = chosen {
+            info!(log, "chose interface {}", chosen);
+            ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
+        } else {
+            bail!("could not find an appropriate Ethernet interface!");
+        }
+    }
+
+    /*
+     * User data phase
+     */
+    phase_user_data(log, &user_data)?;
+
+
+    for script in user_data.scripts {
+        /*
+         * handle the userscripts we have in the user-data:
+         */
+        phase_userscript(log, &script)?;
+    }
+
+    write_lines(log, STAMP, &[ds.uuid])?;
+
+    Ok(())
+}
+
+fn run_amazon(log: &Logger) -> Result<(), failure::Error> {
     /*
      * Sadly, Amazon has no mechanism for metadata access that does not require
      * a correctly configured IP interface.  In addition, the available NIC
@@ -1345,7 +1741,7 @@ fn run_amazon(log: &Logger) -> Result<()> {
      */
     if let Some(pk) = amazon_metadata_get(log, "public-keys/0/openssh-key")? {
         let pubkeys = vec![pk];
-        phase_pubkeys(log, &pubkeys)?;
+        ensure_pubkeys(log, "root",&pubkeys)?;
     } else {
         warn!(log, "no SSH public key?");
     }
@@ -1365,7 +1761,7 @@ fn run_amazon(log: &Logger) -> Result<()> {
     Ok(())
 }
 
-fn run_smartos(log: &Logger) -> Result<()> {
+fn run_smartos(log: &Logger) -> Result<(), failure::Error> {
     let uuid = if let Mdata::Found(uuid) = mdata_get(log, "sdc:uuid")? {
         uuid.trim().to_string()
     } else {
@@ -1422,8 +1818,8 @@ fn run_smartos(log: &Logger) -> Result<()> {
 
                 let sfx = format!("ip{}", i);
 
-                if let Err(e) = ensure_ipv4_interface(log, &sfx, &nic.mac,
-                    &ip)
+                if let Err(e) = ensure_ipv4_interface(log, &sfx, Some(&nic.mac),
+                    None, &ip)
                 {
                     error!(log, "IFACE {}/{} ERROR: {}", nic.interface, sfx, e);
                 }
@@ -1445,7 +1841,7 @@ fn run_smartos(log: &Logger) -> Result<()> {
     if let Mdata::Found(resolvers) = mdata_get(log, "sdc:resolvers")? {
         let resolvers: Vec<String> = serde_json::from_str(&resolvers)?;
 
-        phase_dns(log, &resolvers)?;
+        ensure_dns_nameservers(log, &resolvers)?;
     }
 
     /*
@@ -1456,7 +1852,7 @@ fn run_smartos(log: &Logger) -> Result<()> {
             .map(|s| s.trim().to_string())
             .collect();
 
-        phase_pubkeys(log, &pubkeys)?;
+        ensure_pubkeys(log, "root",&pubkeys)?;
     }
 
     /*
@@ -1472,7 +1868,7 @@ fn run_smartos(log: &Logger) -> Result<()> {
     Ok(())
 }
 
-fn run_digitalocean(log: &Logger) -> Result<()> {
+fn run_digitalocean(log: &Logger) -> Result<(), failure::Error> {
     /*
      * First, locate and mount the metadata ISO.  We need to load the droplet ID
      * so that we can determine if we have completed first boot processing for
@@ -1526,7 +1922,7 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
     /*
      * Read metadata from the file system:
      */
-    let md: Option<Metadata> = read_json(
+    let md: Option<DOMetadata> = read_json(
         &format!("{}/digitalocean_meta_data.json", MOUNTPOINT))?;
 
     let md = if let Some(md) = md {
@@ -1564,8 +1960,8 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
             continue;
         }
 
-        if let Err(e) = ensure_ipv4_interface(log, "private", &iface.mac,
-            &iface.ipv4.cidr()?)
+        if let Err(e) = ensure_ipv4_interface(log, "private", Some(&iface.mac),
+            None, &iface.ipv4.cidr()?)
         {
             /*
              * Report the error, but drive on in case we can complete other
@@ -1580,8 +1976,8 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
             continue;
         }
 
-        if let Err(e) = ensure_ipv4_interface(log, "public", &iface.mac,
-            &iface.ipv4.cidr()?)
+        if let Err(e) = ensure_ipv4_interface(log, "public", Some(&iface.mac),
+            None, &iface.ipv4.cidr()?)
         {
             /*
              * Report the error, but drive on in case we can complete other
@@ -1595,16 +1991,16 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
         }
 
         if let Some(anchor) = &iface.anchor_ipv4 {
-            if let Err(e) = ensure_ipv4_interface(log, "anchor", &iface.mac,
-                &anchor.cidr()?)
+            if let Err(e) = ensure_ipv4_interface(log, "anchor", Some(&iface.mac),
+                None, &anchor.cidr()?)
             {
                 error!(log, "ANCHOR IFACE ERROR: {}", e);
             }
         }
     }
 
-    phase_dns(log, &md.dns.nameservers)?;
-    phase_pubkeys(log, md.public_keys.as_slice())?;
+    ensure_dns_nameservers(log, &md.dns.nameservers)?;
+    ensure_pubkeys(log, "root",md.public_keys.as_slice())?;
 
     /*
      * Get userscript:
@@ -1620,13 +2016,13 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
     Ok(())
 }
 
-fn phase_reguid_zpool(log: &Logger) -> Result<()> {
+fn phase_reguid_zpool(log: &Logger) -> Result<(), failure::Error> {
     info!(log, "regenerate pool guid for rpool");
     zpool::zpool_reguid("rpool")?;
     Ok(())
 }
 
-fn phase_expand_zpool(log: &Logger) -> Result<()> {
+fn phase_expand_zpool(log: &Logger) -> Result<(), failure::Error> {
     /*
      * NOTE: Though it might seem like we could skip directly to using "zpool
      * online -e ...", there appears to be at least one serious deadlock in this
@@ -1655,7 +2051,7 @@ fn phase_expand_zpool(log: &Logger) -> Result<()> {
     Ok(())
 }
 
-fn phase_add_swap(log: &Logger) -> Result<()> {
+fn phase_add_swap(log: &Logger) -> Result<(), failure::Error> {
     /*
      * Next, add a swap device.  Ideally we will have enough room for a swap
      * file twice the size of physical memory -- but if not, we want to use at
@@ -1698,7 +2094,7 @@ fn phase_add_swap(log: &Logger) -> Result<()> {
     Ok(())
 }
 
-fn phase_set_hostname(log: &Logger, hostname: &str) -> Result<()> {
+fn phase_set_hostname(log: &Logger, hostname: &str) -> Result<(), failure::Error> {
     /*
      * Check nodename:
      */
@@ -1786,7 +2182,176 @@ fn phase_set_hostname(log: &Logger, hostname: &str) -> Result<()> {
     Ok(())
 }
 
-fn phase_dns(log: &Logger, nameservers: &[String]) -> Result<()> {
+fn phase_user_data(log: &Logger, user_data: &UserData) -> Result<(), failure::Error> {
+
+    //First Apply cloud configurations
+    for cc in user_data.cloud_configs.clone() {
+        /*
+         * First Apply the groups
+         */
+        if let Some(groups) = cc.groups {
+            for group in groups {
+                ensure_group(group)?;
+            }
+        }
+
+        for user in cc.users {
+            ensure_user(log, &user)?;
+        }
+
+        if let Some(files) = cc.write_files {
+            for file in files {
+                ensure_write_file(log, &file)?;
+            }
+        }
+
+        /*
+        if let Some(ca_certs) = cc.ca_certs {
+
+        }
+        */
+
+        if let Some(packages) = cc.packages {
+            match packages {
+                Multiformat::String(pkg) => {
+                    ensure_packages(&log, vec![pkg])?;
+                }
+                Multiformat::List(pkgs) => {
+                    ensure_packages(&log, pkgs)?;
+                }
+                _ => {}
+            }
+        }
+
+        /*
+         * Set general ssh Authorized keys
+         */
+        if let Some(keys) = cc.ssh_authorized_keys {
+            ensure_pubkeys(log, "root", &keys)?;
+        }
+    }
+
+    //Then run the scripts
+
+    Ok(())
+}
+
+fn ensure_packages(log: &&Logger, pkgs: Vec<String>) -> Result<(), failure::Error> {
+    info!(log, "installing packages {:#?}", pkgs);
+    let mut pkg_cmd = Command::new(PKG);
+    pkg_cmd.env_clear();
+    pkg_cmd.arg("install");
+    pkg_cmd.arg("-v");
+
+    for pkg in pkgs {
+        pkg_cmd.arg(pkg);
+    }
+
+    let mut child = pkg_cmd.spawn()?;
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("failed package installation see log messages above")
+    }
+
+    info!(log, "packages installed");
+    Ok(())
+}
+
+fn ensure_write_file(log: &Logger, file: &WriteFileData) -> Result<(), failure::Error> {
+    info!(log, "creating file {}", file.path);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&file.path)?;
+    let mut w = std::io::BufWriter::new(&f);
+
+    match file.encoding {
+        WriteFileEncoding::None => {
+            trace!(log, "writing string data");
+            w.write_all(file.content.as_bytes())?;
+        }
+        WriteFileEncoding::B64 => {
+            trace!(log, "writing base64 encoded data");
+            w.write_all(base64Decode(&file.content)?.as_slice())?;
+        }
+        WriteFileEncoding::Gzip => {
+            trace!(log, "writing gzip encoded data");
+            let mut content_clone = file.content.clone();
+            let mut conent_bytes = content_clone.as_str().as_bytes();
+            let mut d = GzDecoder::new(BufReader::new(&mut conent_bytes));
+            IOCopy(&mut d, &mut w)?;
+        }
+        WriteFileEncoding::B64Gzip => {
+            trace!(log, "writing gzipped base64 encoded data");
+            let decoded_content = base64Decode(&file.content)?;
+            let mut d = GzDecoder::new(decoded_content.as_slice());
+            IOCopy(&mut d, &mut w)?;
+        }
+    }
+
+    if let Some(mode_string) = &file.permissions {
+        info!(log, "setting permissions of file {} to {}", file.path, mode_string);
+        let meta = &f.metadata()?;
+        let mut perms = meta.permissions();
+        perms.set_mode(mode_string.parse::<u32>()?);
+    }
+
+    if let Some(owner) = &file.owner {
+        info!(log, "setting owner and group of file {} to {}", file.path, owner);
+        let mut uid: uid_t;
+        let mut gid: gid_t;
+        if owner.contains(":") {
+            if let Some((u, g)) = owner.split_once(":") {
+                if let Some(user) = users::get_user_by_name(u) {
+                    uid = user.uid();
+                } else {
+                    bail!("could not find user {} in system", u)
+                }
+
+                if let Some(group) = users::get_group_by_name(g) {
+                    gid = group.gid();
+                } else {
+                    bail!("could not find group {} in system", g)
+                }
+            } else {
+                bail!("wrong user group string invalid config")
+            }
+        } else {
+            let meta = f.metadata()?;
+            gid = meta.st_gid();
+            if let Some(u) = users::get_user_by_name(&owner) {
+                uid = u.uid();
+            } else {
+                bail!("could not find user {} in system", &owner)
+            }
+        }
+        chown(&file.path, uid, gid, false)?;
+    }
+
+    Ok(())
+}
+
+/// Actually perform the change of owner on a path
+fn chown<P: AsRef<Path>>(path: P, uid: uid_t, gid: gid_t, follow: bool) -> IOResult<()> {
+    let path = path.as_ref();
+    let s = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let ret = unsafe {
+        if follow {
+            libc::chown(s.as_ptr(), uid, gid)
+        } else {
+            libc::lchown(s.as_ptr(), uid, gid)
+        }
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(IOError::last_os_error())
+    }
+}
+
+
+fn ensure_dns_nameservers(log: &Logger, nameservers: &[String]) -> Result<(), failure::Error> {
     /*
      * DNS Servers:
      */
@@ -1826,15 +2391,63 @@ fn phase_dns(log: &Logger, nameservers: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn phase_pubkeys(log: &Logger, public_keys: &[String]) -> Result<()> {
+fn ensure_dns_search(log: &Logger, dns_search: &[String]) -> Result<(), failure::Error> {
+    /*
+     * DNS Servers:
+     */
+    info!(log, "checking DNS search configuration...");
+    let lines = read_lines_maybe("/etc/resolv.conf")?;
+    info!(log, "existing DNS search config lines: {:#?}", &lines);
+
+    let mut dirty = false;
+    let mut file: Vec<String> = Vec::new();
+
+    for ns in dns_search.iter() {
+        let l = format!("search {}", ns);
+        if !lines.contains(&l) {
+            info!(log, "ADD DNS Search CONFIG LINE: {}", l);
+            file.push(l);
+            dirty = true;
+        }
+    }
+
+    for l in &lines {
+        let ll: Vec<_> = l.splitn(2, ' ').collect();
+        if ll.len() == 2 && ll[0] == "search" &&
+            !dns_search.contains(&ll[1].to_string())
+        {
+            info!(log, "REMOVE DNS Search CONFIG LINE: {}", l);
+            file.push(format!("#{}", l));
+            dirty = true;
+        } else {
+            file.push(l.to_string());
+        }
+    }
+
+    if dirty {
+        write_lines(log, "/etc/resolv.conf", file.as_ref())?;
+    }
+
+    Ok(())
+}
+
+fn ensure_pubkeys(log: &Logger, user: &str, public_keys: &[String]) -> Result<(), failure::Error> {
     /*
      * Manage the public keys:
      */
-    info!(log, "checking SSH public keys...");
+    info!(log, "checking SSH public keys for user {}...", user);
 
-    ensure_dir(log, "/root/.ssh")?;
+    let sshdir = if user == "root" {
+        format!("/root/.ssh")
+    } else {
+        format!("/export/home/{}/.ssh", user)
+    };
 
-    let mut file = read_lines_maybe("/root/.ssh/authorized_keys")?;
+    ensure_dir(log, &sshdir)?;
+
+    let authorized_keys = sshdir + "/authorized_keys";
+
+    let mut file = read_lines_maybe(&authorized_keys)?;
     info!(log, "existing SSH public keys: {:#?}", &file);
 
     let mut dirty = false;
@@ -1847,13 +2460,13 @@ fn phase_pubkeys(log: &Logger, public_keys: &[String]) -> Result<()> {
     }
 
     if dirty {
-        write_lines(log, "/root/.ssh/authorized_keys", file.as_ref())?;
+        write_lines(log, &authorized_keys, file.as_ref())?;
     }
 
     Ok(())
 }
 
-fn phase_userscript(log: &Logger, userscript: &str) -> Result<()> {
+fn phase_userscript(log: &Logger, userscript: &str) -> Result<(), failure::Error> {
     /*
      * If the userscript is basically empty, just ignore it.
      */

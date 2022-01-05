@@ -8,7 +8,7 @@ use std::io::Write;
 use super::common::*;
 
 pub fn fmthard(log: &Logger, disk: &str, part: &str, tag: &str, flag: &str,
-    start: u64, size: u64) -> Result<()>
+    start: u64, size: u64) -> Result<(), failure::Error>
 {
     let cmd = format!("{}:{}:{}:{}:{}", part, tag, flag, start, size);
     let path = format!("/dev/rdsk/{}p0", disk);
@@ -28,7 +28,7 @@ pub fn fmthard(log: &Logger, disk: &str, part: &str, tag: &str, flag: &str,
     Ok(())
 }
 
-pub fn zpool_logical_size(pool: &str) -> Result<u64> {
+pub fn zpool_logical_size(pool: &str) -> Result<u64, failure::Error> {
     /*
      * It is tempting to use "zpool list" to obtain the pool size, but that size
      * does not account for parity and overhead in the way that one might
@@ -60,7 +60,7 @@ pub fn zpool_logical_size(pool: &str) -> Result<u64> {
     Ok(used.saturating_add(avail) / 1024 / 1024)
 }
 
-pub fn zpool_expand(pool: &str, disk: &str) -> Result<()> {
+pub fn zpool_expand(pool: &str, disk: &str) -> Result<(), failure::Error> {
     let output = std::process::Command::new("/sbin/zpool")
         .env_clear()
         .arg("online")
@@ -76,7 +76,7 @@ pub fn zpool_expand(pool: &str, disk: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn zpool_reguid(pool: &str) -> Result<()> {
+pub fn zpool_reguid(pool: &str) -> Result<(), failure::Error> {
     let output = std::process::Command::new("/sbin/zpool")
         .env_clear()
         .arg("reguid")
@@ -90,7 +90,7 @@ pub fn zpool_reguid(pool: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn zpool_disk() -> Result<String> {
+pub fn zpool_disk() -> Result<String, failure::Error> {
     let pool = "rpool";
     let output = std::process::Command::new("/sbin/zpool")
         .env_clear()
@@ -140,7 +140,7 @@ struct Vtoc {
     partitions: HashMap<String, Partition>,
 }
 
-fn prtvtoc(disk: &str) -> Result<Vtoc> {
+fn prtvtoc(disk: &str) -> Result<Vtoc, failure::Error> {
     let output = std::process::Command::new("/usr/sbin/prtvtoc")
         .env_clear()
         .arg(format!("/dev/dsk/{}", disk))
@@ -215,7 +215,7 @@ fn prtvtoc(disk: &str) -> Result<Vtoc> {
  * enlarged underlying volume.  This interface is clunky and unfortunate, but
  * I'm not currently aware of a better way.
  */
-pub fn format_expand(log: &Logger, disk: &str) -> Result<()> {
+pub fn format_expand(log: &Logger, disk: &str) -> Result<(), failure::Error> {
     /*
      * We need a temporary file with a list of commands for format(1M) to
      * execute using the "-f" option.
@@ -246,7 +246,7 @@ pub fn format_expand(log: &Logger, disk: &str) -> Result<()> {
  * Check to see if this disk requires expansion at the GPT table level using
  * format(1M).
  */
-pub fn should_expand(disk: &str) -> Result<bool> {
+pub fn should_expand(disk: &str) -> Result<bool, failure::Error> {
     let vtoc = prtvtoc(&disk)?;
 
     if vtoc.sector_size != 512 {
@@ -274,7 +274,7 @@ pub fn should_expand(disk: &str) -> Result<bool> {
 /**
  * Check to see if the data slice should be grown to fill any unallocated space.
  */
-pub fn grow_data_partition(log: &Logger, disk: &str) -> Result<()> {
+pub fn grow_data_partition(log: &Logger, disk: &str) -> Result<(), failure::Error> {
     let vtoc = prtvtoc(&disk)?;
 
     if vtoc.sector_size != 512 {

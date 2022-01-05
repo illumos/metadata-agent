@@ -7,7 +7,8 @@ use slog::Drain;
 use std::sync::Mutex;
 
 pub use slog::{info, warn, error, debug, trace, o, Logger};
-pub use anyhow::{bail, Result, Context};
+pub use anyhow::{Context};
+pub use failure::{ResultExt, bail, Error, Fail};
 
 /**
  * Initialise a logger which writes to stdout, and which does the right thing on
