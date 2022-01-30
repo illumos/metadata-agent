@@ -1307,6 +1307,14 @@ fn run(log: &Logger) -> Result<(), failure::Error> {
             "manufacturer" => smbios.manufacturer.as_str(),
             "product" => smbios.product.as_str(),
             "version" => smbios.version.as_str());
+    } else {
+        info!(log, "no SMBIOS data, looking for cpio device...");
+        let dev = find_cpio_device(log)?;
+        if let Some(dev) = dev {
+            info!(log, "hypervisor type: Generic (no SMBIOS, cpio {})", dev);
+            run_generic(log, "unknown", true)?;
+            return Ok(());
+        }
     }
 
     /*
