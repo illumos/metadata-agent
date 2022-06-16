@@ -7,15 +7,16 @@ use std::io::prelude::*;
 use flate2::read::GzDecoder;
 use std::io::BufReader;
 use std::path::PathBuf;
-use failure::Error;
 use std::fs::File;
 use crate::common::*;
+use anyhow::{Result};
+use thiserror::{Error};
 
 pub mod cloudconfig;
 pub mod networkconfig;
 pub mod multiformat_deserialize;
 
-pub fn read_user_data(log: &Logger, path: &PathBuf) -> Result<UserData, Error> {
+pub fn read_user_data(log: &Logger, path: &PathBuf) -> Result<UserData> {
     // Parse Multipart message from stream
     match read_gz_data(log, path) {
         Ok(data) => Ok(data),
@@ -34,7 +35,7 @@ pub fn read_user_data(log: &Logger, path: &PathBuf) -> Result<UserData, Error> {
     }
 }
 
-fn read_gz_data(log: &Logger, path: &PathBuf) -> Result<UserData, Error> {
+fn read_gz_data(log: &Logger, path: &PathBuf) -> Result<UserData> {
     let gzreader = GzDecoder::new(File::open(path)?);
     if None == gzreader.header() {
         return Err(UserDataError::NotGzData)?;
@@ -44,12 +45,12 @@ fn read_gz_data(log: &Logger, path: &PathBuf) -> Result<UserData, Error> {
     parse_user_data_multipart_stream::<BufReader<GzDecoder<File>>>(log, &mut reader)
 }
 
-fn read_uncompressed(log: &Logger, path: &PathBuf) -> Result<UserData, Error> {
+fn read_uncompressed(log: &Logger, path: &PathBuf) -> Result<UserData> {
     let mut reader = BufReader::new(File::open(path)?);
     parse_user_data_multipart_stream::<BufReader<File>>(log, &mut reader)
 }
 
-fn parse_user_data_multipart_stream<S: BufRead>(log: &Logger, stream: &mut S) -> Result<UserData, Error> {
+fn parse_user_data_multipart_stream<S: BufRead>(log: &Logger, stream: &mut S) -> Result<UserData> {
 
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf)?;
@@ -67,7 +68,7 @@ fn parse_user_data_multipart_stream<S: BufRead>(log: &Logger, stream: &mut S) ->
     Ok(data)
 }
 
-fn parse_file_part(log: &Logger, d: &mut UserData, mime_type: &str, buf: &str) -> Result<(), Error> {
+fn parse_file_part(log: &Logger, d: &mut UserData, mime_type: &str, buf: &str) -> Result<()> {
     match mime_type {
         "text/cloud-config" | "#cloud-config" => {
             let cc = serde_yaml::from_str::<CloudConfig>(buf)?;
@@ -84,13 +85,13 @@ fn parse_file_part(log: &Logger, d: &mut UserData, mime_type: &str, buf: &str) -
     Ok(())
 }
 
-#[derive(Debug, Fail, PartialEq)]
+#[derive(Debug, Error, PartialEq)]
 enum UserDataError {
-    #[fail(display = "format of file {} is not parseable", path)]
+    #[error("format of file {} is not parseable", path)]
     InvalidFile{
         path: String,
     },
-    #[fail(display = "file is not compressed")]
+    #[error("file is not compressed")]
     NotGzData,
 }
 

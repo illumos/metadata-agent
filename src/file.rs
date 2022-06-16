@@ -1,9 +1,14 @@
+/*
+ * Copyright 2020 Oxide Computer Company
+ */
+
 use crate::common::*;
 use std::fs::{DirBuilder, File};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::io::{ErrorKind, BufReader, BufRead, copy as IOCopy, Read, Write};
+use anyhow::{Result};
 
-pub fn ensure_dir(log: &Logger, path: &str) -> Result<(), failure::Error> {
+pub fn ensure_dir(log: &Logger, path: &str) -> Result<()> {
     if !exists_dir(path)? {
         info!(log, "mkdir {}", path);
         DirBuilder::new()
@@ -13,7 +18,7 @@ pub fn ensure_dir(log: &Logger, path: &str) -> Result<(), failure::Error> {
     Ok(())
 }
 
-pub fn exists_dir(p: &str) -> Result<bool, failure::Error> {
+pub fn exists_dir(p: &str) -> Result<bool> {
     let md = match std::fs::metadata(p) {
         Ok(md) => md,
         Err(e) => match e.kind() {
@@ -29,7 +34,7 @@ pub fn exists_dir(p: &str) -> Result<bool, failure::Error> {
     Ok(true)
 }
 
-pub fn exists_file(p: &str) -> Result<bool, failure::Error> {
+pub fn exists_file(p: &str) -> Result<bool> {
     let md = match std::fs::metadata(p) {
         Ok(md) => md,
         Err(e) => match e.kind() {
@@ -46,13 +51,13 @@ pub fn exists_file(p: &str) -> Result<bool, failure::Error> {
 }
 
 
-pub fn read_lines(p: &str) -> Result<Option<Vec<String>>, failure::Error> {
+pub fn read_lines(p: &str) -> Result<Option<Vec<String>>> {
     Ok(read_file(p)?.map(|data| {
         data.lines().map(|a| a.trim().to_string()).collect()
     }))
 }
 
-pub fn read_lines_maybe(p: &str) -> Result<Vec<String>, failure::Error> {
+pub fn read_lines_maybe(p: &str) -> Result<Vec<String>> {
     Ok(match read_lines(p)? {
         None => Vec::new(),
         Some(l) => l,
@@ -61,7 +66,7 @@ pub fn read_lines_maybe(p: &str) -> Result<Vec<String>, failure::Error> {
 
 pub
 
-fn read_file(p: &str) -> Result<Option<String>, failure::Error> {
+fn read_file(p: &str) -> Result<Option<String>> {
     let f = match File::open(p) {
         Ok(f) => f,
         Err(e) => {
@@ -77,7 +82,7 @@ fn read_file(p: &str) -> Result<Option<String>, failure::Error> {
     Ok(Some(out))
 }
 
-pub fn write_file(p: &str, data: &str) -> Result<(), failure::Error> {
+pub fn write_file(p: &str, data: &str) -> Result<()> {
     let f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -88,7 +93,7 @@ pub fn write_file(p: &str, data: &str) -> Result<(), failure::Error> {
     Ok(())
 }
 
-pub fn write_lines<L>(log: &Logger, p: &str, lines: &[L]) -> Result<(), failure::Error>
+pub fn write_lines<L>(log: &Logger, p: &str, lines: &[L]) -> Result<()>
     where L: AsRef<str> + std::fmt::Debug
 {
     info!(log, "----- WRITE FILE: {} ------ {:#?}", p, lines);

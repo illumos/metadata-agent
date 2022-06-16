@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 use serde::{Deserialize};
 use crate::userdata::multiformat_deserialize::Multiformat;
+use anyhow::{Result};
 
-pub fn parse_network_config(path: &PathBuf) -> Result<NetworkConfig, failure::Error> {
+pub fn parse_network_config(path: &PathBuf) -> Result<NetworkConfig> {
     // Try V1 first
     let file = File::open(path)?;
     let f = serde_yaml::from_reader::<File, NetworkConfigFile>(file)?;
@@ -107,9 +108,10 @@ mod tests {
     use std::path::PathBuf;
     use std::str::FromStr;
     use crate::userdata::multiformat_deserialize::Multiformat;
+    use anyhow::{Result};
 
     #[test]
-    fn parse_physical () -> Result<(), failure::Error> {
+    fn parse_physical () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_physical.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -132,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_physical_2 () -> Result<(), failure::Error> {
+    fn parse_physical_2 () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_physical_2.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -164,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_bond () -> Result<(), failure::Error> {
+    fn parse_bond () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_bond.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -197,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_bridge () -> Result<(), failure::Error> {
+    fn parse_bridge () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_bridge.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -230,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_vlan () -> Result<(), failure::Error> {
+    fn parse_vlan () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_vlan.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -263,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_nameserver () -> Result<(), failure::Error> {
+    fn parse_nameserver () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_nameserver.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -313,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_route () -> Result<(), failure::Error> {
+    fn parse_route () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_route.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -362,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_subnet_dhcp () -> Result<(), failure::Error> {
+    fn parse_subnet_dhcp () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_subnet_dhcp.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -398,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_subnet_static () -> Result<(), failure::Error> {
+    fn parse_subnet_static () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_subnet_static.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -454,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_subnet_multiple () -> Result<(), failure::Error> {
+    fn parse_subnet_multiple () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_subnet_multiple.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -515,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_subnet_with_routes () -> Result<(), failure::Error> {
+    fn parse_subnet_with_routes () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_subnet_with_routes.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -572,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_subnet_bonded_vlan () -> Result<(), failure::Error> {
+    fn parse_subnet_bonded_vlan () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_bonded_vlan.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {
@@ -638,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_multiple_vlan () -> Result<(), failure::Error> {
+    fn parse_multiple_vlan () -> Result<()> {
         let cfg = parse_network_config(&PathBuf::from_str("./sample_data/network_config_v1/test_multiple_vlan.yaml")?)?;
         match cfg {
             NetworkConfig::V1(v1) => {

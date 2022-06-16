@@ -1,7 +1,8 @@
 use crate::common::*;
 use crate::file::*;
+use anyhow::{Result};
 
-pub fn ensure_pubkeys(log: &Logger, user: &str, public_keys: &[String]) -> Result<(), failure::Error> {
+pub fn ensure_pubkeys(log: &Logger, user: &str, public_keys: &[String]) -> Result<()> {
     /*
      * Manage the public keys:
      */
