@@ -1,33 +1,34 @@
-MODE=debug
-USER=root
-BIN_GROUP=bin
-SYS_GROUP=sys
+INSTALL = /usr/sbin/install
+BINDIR = /usr/lib
+MANIFESTDIR = /lib/svc/manifest/system
 
-.PHONY: all
+PRE_HASH = pre\#
+HASH = $(PRE_HASH:pre\%=%)
 
-# Convenience magic so packagers don't accidentally package debug builds
-ifdef DESTDIR
-MODE=release
-endif
+SET_OWNER ?= $(HASH)
+$(SET_OWNER)OWNER_BIN = -u root -g bin
+$(SET_OWNER)OWNER_SMF = -u root -g sys
 
-ifndef DESTDIR
-ADDITIONAL_INSTALL_ARGS_BIN += -u $(USER) -g $(BIN_GROUP)
-ADDITIONAL_INSTALL_ARGS_SMF += -u $(USER) -g $(SYS_GROUP)
-endif
+INSTALL_BIN = $(INSTALL) -s -f $(DESTDIR)$(BINDIR) $(OWNER_BIN) -m 0755
+INSTALL_SMF = $(INSTALL) -s -f $(DESTDIR)$(MANIFESTDIR) $(OWNER_SMF) -m 0644
 
-ifeq ($(MODE), release)
-cargo_args += --release
-endif
+build: build-debug
 
-build: target/$(MODE)/metadata
+build-debug:
+	cargo build
 
-target/$(MODE)/metadata:
-	cargo build $(cargo_args)
+build-release:
+	cargo build --release
 
-install: build
+install-%: build-%
 	mkdir -p $(DESTDIR)/usr/lib
 	mkdir -p $(DESTDIR)/lib/svc/manifest/system
-	install -c $(DESTDIR)/usr/lib -m 0755 $(ADDITIONAL_INSTALL_ARGS_BIN) target/$(MODE)/metadata
-	install -c $(DESTDIR)/usr/lib -m 0755 $(ADDITIONAL_INSTALL_ARGS_BIN) userscript.sh
-	install -c $(DESTDIR)/lib/svc/manifest/system -m 0644 $(ADDITIONAL_INSTALL_ARGS_SMF) metadata.xml
-	install -c $(DESTDIR)/lib/svc/manifest/system -m 0644 $(ADDITIONAL_INSTALL_ARGS_SMF) userscript.xml
+	$(INSTALL_BIN) target/$(@:install-%=%)/metadata
+	$(INSTALL_BIN) userscript.sh
+	$(INSTALL_SMF) metadata.xml
+	$(INSTALL_SMF) userscript.xml
+
+install: install-release
+
+clean:
+	cargo clean
