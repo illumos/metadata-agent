@@ -292,7 +292,7 @@ where for<'de> T: Deserialize<'de>
     let s = read_file(p)?;
     match s {
         None => Ok(None),
-        Some(s) => Ok(serde_json::from_str(&s)?)
+        Some(s) => Ok(Some(serde_json::from_str(&s)?))
     }
 }
 
@@ -302,6 +302,7 @@ enum MountOptionValue {
     Value(String),
 }
 
+#[allow(unused)]
 #[derive(Debug)]
 struct Mount {
     special: String,
@@ -316,6 +317,7 @@ struct DNS {
     nameservers: Vec<String>,
 }
 
+#[allow(unused)]
 #[derive(Debug,Deserialize)]
 struct FloatingIP {
     active: bool,
@@ -367,6 +369,7 @@ struct Interfaces {
     private: Option<Vec<Interface>>,
 }
 
+#[allow(unused)]
 #[derive(Debug,Deserialize)]
 struct Metadata {
     auth_key: String,
@@ -381,6 +384,7 @@ struct Metadata {
     user_data: Option<String>,
 }
 
+#[allow(unused)]
 #[derive(Debug,Deserialize)]
 struct SdcNic {
     mac: String,
