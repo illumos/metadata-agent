@@ -228,6 +228,8 @@ pub fn format_expand(log: &Logger, disk: &str) -> Result<()> {
 
     let output = std::process::Command::new("/usr/sbin/format")
         .env_clear()
+        .env("NOINUSE_CHECK", "1")
+        .env("_LIBDISKMGT_INSTALL", "1")
         .arg("-d").arg(disk)
         .arg("-f").arg(tf.path().to_str().unwrap())
         .output()?;
