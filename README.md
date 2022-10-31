@@ -50,3 +50,61 @@ image so that they are already imported when the image first boots in the
 guest.  The services include dependent relationships with several early boot
 networking and identity services in an attempt to ensure the metadata agent
 runs before network services are completely online.
+
+## Metadata CPIO Device
+
+Not all hypervisor environments provide a self-describing configuration
+metadata service.  In order to ease the creation of automatically configured
+guests in such hypervisor environments, the metadata agent will fall back to
+searching for a block device that contains a CPIO archive containing
+configuration files.  Note that no file system is expected on the device, just
+the output of `cpio -o` starting at LBA 0 of the emulated disk.
+
+The following configuration files may appear in the CPIO archive:
+
+- `nodename` (optional)
+
+  A plain text file with the hostname to use for the guest on the first
+  line of the file.  This name will be used to populate
+  [nodename(5)](https://illumos.org/man/5/nodename) and
+  [hosts(5)](https://illumos.org/man/5/hosts), and the live hostname
+  as reported by [hostname(1)](https://illumos.org/man/1/hostname).
+
+- `authorized_keys` (optional)
+
+  This file will be installed as `/root/.ssh/authorized_keys` and should
+  contain a list of SSH keys in the usual format expected by `sshd`.
+
+- `config.toml` (optional)
+
+  This TOML-formatted file can contain overrides and other configuration.
+  At present, only one key is supported:
+
+  * `network.skip` (boolean, optional, defaults to `false`)
+
+  For example, the following configuration file will cause the metadata
+  agent to skip any attempt to use DHCP to configure a network
+  interface:
+
+  ```toml
+  [network]
+  skip = true
+  ```
+
+- `firstboot.sh` (optional)
+
+  This file may contain a shell script that will be started on first boot.
+
+  Once the script has completed, the system will try not to start the script
+  again on subsequent boots.  If the system crashes part way through running
+  the script, or there is some other unexpected failure, it may not be possible
+  to record that the script completed and it may be started again immediately
+  or on subsequent boots.  As such, the provided script should be idempotent.
+
+  The provided script must begin with a valid interpreter line; e.g.,
+
+  ```sh
+  #!/bin/bash
+
+  echo ok
+  ```

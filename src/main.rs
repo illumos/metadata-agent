@@ -296,6 +296,28 @@ where for<'de> T: Deserialize<'de>
     }
 }
 
+fn read_toml<T>(p: &str) -> Result<Option<T>>
+where for<'de> T: Deserialize<'de>
+{
+    let s = read_file(p)?;
+    match s {
+        None => Ok(None),
+        Some(s) => Ok(Some(toml::from_str(&s)?))
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    network: ConfigNetwork,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ConfigNetwork {
+    #[serde(default)]
+    skip: bool,
+}
+
 #[derive(Debug)]
 enum MountOptionValue {
     Present,
@@ -1085,7 +1107,7 @@ fn run(log: &Logger) -> Result<()> {
      * Try first to use SMBIOS information to determine what kind of hypervisor
      * this guest is running on:
      */
-    if let Some(smbios) = smbios(log)? {
+    let uuid = if let Some(smbios) = smbios(log)? {
         info!(log, "SMBIOS information: {:?}", smbios);
 
         match (smbios.manufacturer.as_str(), smbios.product.as_str()) {
@@ -1113,42 +1135,36 @@ fn run(log: &Logger) -> Result<()> {
             }
             ("OmniOS", "OmniOS HVM") => {
                 info!(log, "hypervisor type: OmniOS BHYVE (from SMBIOS)");
-                /*
-                 * Skip networking under OmniOS for now, until we figure out the
-                 * appropriate strategy for configuring networking in the guest.
-                 */
-                run_generic(log, &smbios.uuid, false)?;
+                run_generic(log, &smbios.uuid)?;
                 return Ok(());
             }
             ("QEMU", _) => {
                 info!(log, "hypervisor type: Generic QEMU (from SMBIOS)");
-                run_generic(log, &smbios.uuid, true)?;
+                run_generic(log, &smbios.uuid)?;
                 return Ok(());
             }
             ("VMware, Inc.", "VMware Virtual Platform") => {
                 info!(log, "hypervisor type: VMware (from SMBIOS)");
-                run_generic(log, &smbios.uuid, true)?;
+                run_generic(log, &smbios.uuid)?;
                 return Ok(());
             }
             _ => {}
         }
 
-        error!(log, "unrecognised SMBIOS information";
+        warn!(log, "unrecognised SMBIOS information";
             "manufacturer" => smbios.manufacturer.as_str(),
             "product" => smbios.product.as_str(),
             "version" => smbios.version.as_str());
+        smbios.uuid
     } else {
-        info!(log, "no SMBIOS data, looking for cpio device...");
-        let dev = find_cpio_device(log)?;
-        if let Some(dev) = dev {
-            info!(log, "hypervisor type: Generic (no SMBIOS, cpio {})", dev);
-            run_generic(log, "unknown", true)?;
-            return Ok(());
-        }
-    }
+        info!(log, "no SMBIOS data, falling back to probing for metadata...");
+        "unknown".to_string()
+    };
 
     /*
-     * If we could not guess based on the hypervisor, fall back to probing:
+     * If we could not guess based on the hypervisor, fall back to probing.
+     *
+     * First, we'll look for the SmartOS metadata commands and see if they work:
      */
     if mdata_probe(log)? {
         info!(log, "hypervisor type: SmartOS (mdata probe)");
@@ -1157,14 +1173,37 @@ fn run(log: &Logger) -> Result<()> {
     }
 
     /*
-     * As a last level fallback, try the DigitalOcean mechanism:
+     * If that doesn't work, we'll try looking for a cpio archive with
+     * instructions:
      */
-    info!(log, "hypervisor type: DigitalOcean (wild guess)");
-    run_digitalocean(log)?;
+    info!(log, "looking for cpio devices...");
+    let dev = find_cpio_device(log)?;
+    if let Some(dev) = dev {
+        info!(log, "hypervisor type: Generic (probed cpio {})", dev);
+        run_generic(log, &uuid)?;
+        return Ok(());
+    }
+
+    /*
+     * If that doesn't work, we'll try to locate a hsfs image from Digital
+     * Ocean.  In future we could more generically look for cloud-init metadata.
+     */
+    info!(log, "looking for hsfs devices...");
+    let dev = find_device()?;
+    if let Some(dev) = dev {
+        info!(log, "hypervisor type: DigitalOcean (probed hsfs {})", dev);
+        run_digitalocean(log)?;
+        return Ok(());
+    }
+
+    /*
+     * Otherwise, we don't know what to do.
+     */
+    error!(log, "no metadata source found; giving up!");
     Ok(())
 }
 
-fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<()> {
+fn run_generic(log: &Logger, smbios_uuid: &str) -> Result<()> {
     /*
      * Load our stamp file to see if the Guest UUID has changed.
      */
@@ -1208,6 +1247,13 @@ fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<()> {
     }
 
     /*
+     * The archive may contain a configuration file that influences our
+     * behaviour.
+     */
+    let c: Config = read_toml(&format!("{}/config.toml", UNPACKDIR))?
+        .unwrap_or_default();
+
+    /*
      * Get a system hostname from the archive, if provided.  Make sure to set
      * this before engaging DHCP, so that "virsh net-dhcp-leases default" can
      * display the hostname in the lease record instead of "unknown".
@@ -1217,7 +1263,17 @@ fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<()> {
         phase_set_hostname(log, &name.trim())?;
     }
 
-    if network {
+    /*
+     * Get SSH public keys from the archive, if provided.  Do this before we try
+     * to configure networking, in case that is partially successful and having
+     * the keys in place would be helpful for debugging.
+     */
+    let keys = format!("{}/authorized_keys", UNPACKDIR);
+    if let Some(keys) = read_lines(&keys)? {
+        phase_pubkeys(log, keys.as_slice())?;
+    }
+
+    if !c.network.skip {
         /*
          * For now, we will configure one NIC with DHCP.  Virtio interfaces are
          * preferred.
@@ -1247,14 +1303,6 @@ fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<()> {
         } else {
             bail!("could not find an appropriate Ethernet interface!");
         }
-    }
-
-    /*
-     * Get SSH public keys from the archive, if provided:
-     */
-    let keys = format!("{}/authorized_keys", UNPACKDIR);
-    if let Some(keys) = read_lines(&keys)? {
-        phase_pubkeys(log, keys.as_slice())?;
     }
 
     /*
@@ -1912,4 +1960,26 @@ fn phase_userscript(log: &Logger, userscript: &str) -> Result<()> {
     smf_enable(log, FMRI_USERSCRIPT)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use anyhow::Result;
+    use super::Config;
+
+    #[test]
+    fn config_defaults() -> Result<()> {
+        let input = "\n";
+        let c: Config = toml::from_str(&input)?;
+        assert!(!c.network.skip);
+        Ok(())
+    }
+
+    #[test]
+    fn config_skip_network() -> Result<()> {
+        let input = "[network]\nskip = true\n";
+        let c: Config = toml::from_str(&input)?;
+        assert!(c.network.skip);
+        Ok(())
+    }
 }
