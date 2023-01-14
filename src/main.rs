@@ -84,6 +84,34 @@ fn amazon_metadata_get(log: &Logger, key: &str) -> Result<Option<String>> {
     amazon_metadata_getx(log, &format!("meta-data/{}", key))
 }
 
+fn vultr_metadata_get(log: &Logger, key: &str) -> Result<Option<String>> {
+    let url = format!("http://169.254.169.254/v1/{}", key);
+
+    let cb = reqwest::blocking::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    loop {
+        match cb.get(&url).send() {
+            Ok(res) => {
+                if res.status().is_success() {
+                    let val = res.text()?.trim_end_matches('\n').to_string();
+                    return Ok(Some(val));
+                } else if res.status().as_u16() == 404 {
+                    return Ok(None);
+                }
+
+                error!(log, "metadata {}: bad status {}", key, res.status());
+            }
+            Err(e) => {
+                error!(log, "metadata {}: bad status {}", key, e);
+            }
+        }
+
+        sleep(5_000);
+    }
+}
+
 fn smf_enable(log: &Logger, fmri: &str) -> Result<()> {
     info!(log, "exec: svcadm enable {}", fmri);
     let output = Command::new(SVCADM)
@@ -1121,6 +1149,11 @@ fn run(log: &Logger) -> Result<()> {
                 run_digitalocean(log)?;
                 return Ok(());
             }
+            ("Vultr", "Guess") => { // Still got to figure out what this would be
+                info!(log, "hypervisor type: Whatever the hell Vultr is running (from SMBIOS)");
+                run_vultr(log)?;
+                return Ok(());
+            }
             ("Xen", "HVM domU") => {
                 if smbios.version.contains("amazon") {
                     info!(log, "hypervisor type: Amazon AWS Xen (from SMBIOS)");
@@ -1419,6 +1452,79 @@ fn run_amazon(log: &Logger) -> Result<()> {
     } else {
         info!(log, "no user-data?");
     }
+
+    write_lines(log, STAMP, &[instid])?;
+
+    Ok(())
+}
+
+fn run_vultr(log: &Logger) -> Result<()> {
+    let ifaces = dladm_ether_list()?;
+    info!(log, "found these ethernet interfaces: {:?}", ifaces);
+    /*
+     * Vultr only has one nic per VM
+     */
+    let chosen = ifaces.iter().next().map(|x| x.as_str());
+
+    if let Some(chosen) = chosen {
+        info!(log, "chose interface {}", chosen);
+        ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
+    } else {
+        bail!("could not find an appropriate Ethernet interface!");
+    }
+
+    /*
+     * Determine the instance ID, using the metadata service:
+     */
+    let instid = if let Some(id) = vultr_metadata_get(log, "instance-v2-id")? {
+        id
+    } else {
+        bail!("could not determine instance ID");
+    };
+
+    /*
+     * Load our stamp file to see if the Instance ID has changed.
+     */
+    if let Some([id]) = read_lines(STAMP)?.as_deref() {
+        if id.trim() == instid {
+            info!(log, "this guest has already completed first \
+                boot processing, halting");
+            return Ok(());
+        } else {
+            info!(log, "guest Instance ID changed ({} -> {}), reprocessing",
+                id.trim(), instid);
+        }
+    }
+
+    phase_reguid_zpool(log)?;
+
+    /*
+     * Determine the node name for this guest:
+     */
+    let (src, n) = if let Some(hostname) = dhcpinfo(log, "hostname")? {
+        ("DHCP", hostname.trim().to_string())
+    } else if let Some(hostname) = vultr_metadata_get(log, "hostname")? {
+        ("metadata", hostname.trim().to_string())
+    } else {
+        bail!("could not get hostname for this VM");
+    };
+    info!(log, "VM node name is \"{}\" (from {})", n, src);
+    phase_set_hostname(log, &n)?;
+
+    /*
+     * Get public key:
+     */
+    if let Some(pk) = vultr_metadata_get(log, "public-keys")? {
+        let pubkeys = vec![pk];
+        phase_pubkeys(log, &pubkeys)?;
+    } else {
+        warn!(log, "no SSH public key?");
+    }
+
+    /*
+     * Vultr doesn't support user-data yet
+     */
+    info!(log, "no user-data?");
 
     write_lines(log, STAMP, &[instid])?;
 
