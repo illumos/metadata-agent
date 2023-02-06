@@ -4,40 +4,40 @@
  *
  */
 
-mod zpool;
 mod common;
-mod userdata;
-mod public_keys;
 mod file;
+mod public_keys;
+mod userdata;
+mod zpool;
 
-use std::collections::HashMap;
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::prelude::*;
-use std::io::{ErrorKind, BufReader, BufRead, copy as IOCopy, Read, Write};
-use std::net::Ipv4Addr;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::process::{Command};
-use userdata::read_user_data;
+use anyhow::Result;
+use base64::decode as base64Decode;
 use flate2::read::GzDecoder;
-use base64::{decode as base64Decode};
-use std::ffi::{CString, OsStr, OsString};
-use std::io::Error as IOError;
-use std::io::Result as IOResult;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::ffi::OsStrExt;
-use users;
 use libc;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::ffi::{CString, OsStr, OsString};
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::prelude::*;
+use std::io::Error as IOError;
+use std::io::Result as IOResult;
+use std::io::{copy as IOCopy, BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::Ipv4Addr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use userdata::read_user_data;
+use users;
 use users::User;
-use anyhow::{Result};
 
-use common::*;
-use file::*;
+use crate::userdata::cloudconfig::{UserConfig, WriteFileData, WriteFileEncoding};
+use crate::userdata::multiformat_deserialize::Multiformat;
 use crate::userdata::networkconfig::{NetworkDataV1Iface, NetworkDataV1Subnet};
 use crate::userdata::UserData;
-use crate::userdata::cloudconfig::{UserConfig, WriteFileEncoding, WriteFileData};
-use crate::userdata::multiformat_deserialize::Multiformat;
+use common::*;
+use file::*;
 
 const METADATA_DIR: &str = "/var/metadata";
 const STAMP: &str = "/var/metadata/stamp";
@@ -124,10 +124,7 @@ fn smf_enable(log: &Logger, fmri: &str) -> Result<()> {
 
 fn dhcpinfo(log: &Logger, key: &str) -> Result<Option<String>> {
     info!(log, "exec: dhcpinfo {}", key);
-    let output = Command::new(DHCPINFO)
-        .env_clear()
-        .arg(key)
-        .output()?;
+    let output = Command::new(DHCPINFO).env_clear().arg(key).output()?;
 
     if !output.status.success() {
         bail!("dhcpinfo {} failed: {}", key, output.info());
@@ -164,7 +161,8 @@ fn smbios(log: &Logger) -> Result<Option<Smbios>> {
         let mut u = "".to_string();
 
         for l in String::from_utf8(output.stdout)?.lines() {
-            let t: Vec<_> = l.trim()
+            let t: Vec<_> = l
+                .trim()
                 .splitn(2, ':')
                 .map(|s| s.trim().to_string())
                 .collect();
@@ -184,7 +182,12 @@ fn smbios(log: &Logger) -> Result<Option<Smbios>> {
             }
         }
 
-        Ok(Some(Smbios { manufacturer: m, product: p, version: v, uuid: u, }))
+        Ok(Some(Smbios {
+            manufacturer: m,
+            product: p,
+            version: v,
+            uuid: u,
+        }))
     }
 }
 
@@ -196,10 +199,7 @@ enum Mdata {
 
 fn mdata_get(log: &Logger, key: &str) -> Result<Mdata> {
     info!(log, "mdata-get \"{}\"...", key);
-    let output = Command::new(MDATA_GET)
-        .env_clear()
-        .arg(key)
-        .output()?;
+    let output = Command::new(MDATA_GET).env_clear().arg(key).output()?;
 
     Ok(match output.status.code() {
         Some(0) => {
@@ -258,12 +258,13 @@ fn mdata_probe(log: &Logger) -> Result<bool> {
 }
 
 fn read_json<T>(p: &str) -> Result<Option<T>>
-where for<'de> T: Deserialize<'de>
+where
+    for<'de> T: Deserialize<'de>,
 {
     let s = read_file(p)?;
     match s {
         None => Ok(None),
-        Some(s) => Ok(serde_json::from_str(&s)?)
+        Some(s) => Ok(serde_json::from_str(&s)?),
     }
 }
 
@@ -282,17 +283,17 @@ struct Mount {
     time: u64,
 }
 
-#[derive(Debug,Deserialize)]
+#[derive(Debug, Deserialize)]
 struct DNS {
     nameservers: Vec<String>,
 }
 
-#[derive(Debug,Deserialize)]
+#[derive(Debug, Deserialize)]
 struct FloatingIP {
     active: bool,
 }
 
-#[derive(Debug,Deserialize)]
+#[derive(Debug, Deserialize)]
 struct IPv4 {
     ip_address: String,
     gateway: String,
@@ -323,7 +324,7 @@ impl IPv4 {
     }
 }
 
-#[derive(Debug,Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Interface {
     anchor_ipv4: Option<IPv4>,
     ipv4: IPv4,
@@ -332,13 +333,13 @@ struct Interface {
     type_: String,
 }
 
-#[derive(Debug,Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Interfaces {
     public: Option<Vec<Interface>>,
     private: Option<Vec<Interface>>,
 }
 
-#[derive(Debug,Deserialize)]
+#[derive(Debug, Deserialize)]
 struct DOMetadata {
     auth_key: String,
     dns: DNS,
@@ -352,7 +353,7 @@ struct DOMetadata {
     user_data: Option<String>,
 }
 
-#[derive(Debug,Deserialize)]
+#[derive(Debug, Deserialize)]
 struct SdcNic {
     mac: String,
     interface: String,
@@ -377,9 +378,7 @@ impl SdcNic {
  */
 fn mounts() -> Result<Vec<Mount>> {
     let mnttab = read_lines("/etc/mnttab")?.unwrap();
-    let rows: Vec<Vec<_>> = mnttab.iter()
-        .map(|m| { m.split('\t').collect() })
-        .collect();
+    let rows: Vec<Vec<_>> = mnttab.iter().map(|m| m.split('\t').collect()).collect();
 
     assert!(rows.len() >= 5);
 
@@ -461,8 +460,12 @@ fn find_cpio_device(log: &Logger) -> Result<Option<String>> {
                     out.push(ent.path());
                 }
             }
-            Err(e) => warn!(log, "detecting archive on {}: {:?}",
-                ent.path().display(), e),
+            Err(e) => warn!(
+                log,
+                "detecting archive on {}: {:?}",
+                ent.path().display(),
+                e
+            ),
             _ => {}
         }
     }
@@ -510,7 +513,6 @@ fn find_cidata_devices(log: &Logger) -> Result<Option<Vec<CiDataDevice>>> {
             continue;
         }
 
-
         let mut dev = CiDataDevice::default();
         dev.path = ent.path().to_str().unwrap().to_string();
         let mut count = 0;
@@ -521,11 +523,16 @@ fn find_cidata_devices(log: &Logger) -> Result<Option<Vec<CiDataDevice>>> {
                 }
                 if line.contains(":") {
                     if let Some((key, value)) = line.split_once(":") {
-                        if key.trim().to_lowercase() == "volume_label" {
+                        if key.trim().to_lowercase() == "volume_label"
+                            || key.trim().to_lowercase() == "volume_id"
+                        {
                             let label = value.replace("'", "").trim().to_lowercase();
                             if label == "cidata" {
                                 dev.label = label;
-                                debug!(log, "found cidata device {} of type {}", &dev.path, &dev.fstype);
+                                debug!(
+                                    log,
+                                    "found cidata device {} of type {}", &dev.path, &dev.fstype
+                                );
                                 out.push(dev.clone());
                             }
                         }
@@ -561,10 +568,7 @@ fn find_device() -> Result<Option<String>> {
         /*
          * Determine which type of file system resides on the device:
          */
-        let output = Command::new(FSTYP)
-            .env_clear()
-            .arg(ent.path())
-            .output()?;
+        let output = Command::new(FSTYP).env_clear().arg(ent.path()).output()?;
 
         if !output.status.success() {
             continue;
@@ -663,7 +667,7 @@ fn netmask_to_cidr(netmask: &Option<String>) -> Result<u8> {
                     248 => Ok(5),
                     252 => Ok(6),
                     254 => Ok(7),
-                    _ => bail!("invalid netmask: {}", mask)
+                    _ => bail!("invalid netmask: {}", mask),
                 }
             } else if octects[1] != 255 {
                 match octects[1] {
@@ -675,7 +679,7 @@ fn netmask_to_cidr(netmask: &Option<String>) -> Result<u8> {
                     248 => Ok(13),
                     252 => Ok(14),
                     254 => Ok(15),
-                    _ => bail!("invalid netmask: {}", mask)
+                    _ => bail!("invalid netmask: {}", mask),
                 }
             } else if octects[2] != 255 {
                 match octects[2] {
@@ -687,7 +691,7 @@ fn netmask_to_cidr(netmask: &Option<String>) -> Result<u8> {
                     248 => Ok(21),
                     252 => Ok(22),
                     254 => Ok(23),
-                    _ => bail!("invalid netmask: {}", mask)
+                    _ => bail!("invalid netmask: {}", mask),
                 }
             } else if octects[3] != 255 {
                 match octects[3] {
@@ -699,7 +703,7 @@ fn netmask_to_cidr(netmask: &Option<String>) -> Result<u8> {
                     248 => Ok(29),
                     252 => Ok(30),
                     254 => Ok(31),
-                    _ => bail!("invalid netmask: {}", mask)
+                    _ => bail!("invalid netmask: {}", mask),
                 }
             } else {
                 Ok(32)
@@ -713,7 +717,8 @@ fn ipadm_interface_list() -> Result<Vec<String>> {
         .env_clear()
         .arg("show-if")
         .arg("-p")
-        .arg("-o").arg("ifname")
+        .arg("-o")
+        .arg("ifname")
         .output()?;
 
     if !output.status.success() {
@@ -738,7 +743,8 @@ fn ipadm_address_list() -> Result<Vec<IpadmAddress>> {
         .env_clear()
         .arg("show-addr")
         .arg("-p")
-        .arg("-o").arg("addrobj,type,state,addr")
+        .arg("-o")
+        .arg("addrobj,type,state,addr")
         .output()?;
 
     if !output.status.success() {
@@ -747,12 +753,15 @@ fn ipadm_address_list() -> Result<Vec<IpadmAddress>> {
 
     let ents = parse_net_adm(output.stdout)?;
 
-    Ok(ents.iter().map(|ent| IpadmAddress {
-        name: ent[0].to_string(),
-        type_: ent[1].to_string(),
-        state: ent[2].to_string(),
-        cidr: ent[3].to_string(),
-    }).collect())
+    Ok(ents
+        .iter()
+        .map(|ent| IpadmAddress {
+            name: ent[0].to_string(),
+            type_: ent[1].to_string(),
+            state: ent[2].to_string(),
+            cidr: ent[3].to_string(),
+        })
+        .collect())
 }
 
 fn mac_sanitise(input: &str) -> String {
@@ -785,7 +794,8 @@ fn dladm_ether_list() -> Result<Vec<String>> {
         .env_clear()
         .arg("show-ether")
         .arg("-p")
-        .arg("-o").arg("link")
+        .arg("-o")
+        .arg("link")
         .output()?;
 
     if !output.status.success() {
@@ -802,7 +812,8 @@ fn mac_to_nic(mac: &str) -> Result<Option<String>> {
         .arg("show-phys")
         .arg("-m")
         .arg("-p")
-        .arg("-o").arg("link,address")
+        .arg("-o")
+        .arg("link,address")
         .output()?;
 
     if !output.status.success() {
@@ -845,7 +856,8 @@ fn create_zvol(name: &str, size_mib: u64) -> Result<()> {
     let output = std::process::Command::new(ZFS)
         .env_clear()
         .arg("create")
-        .arg("-V").arg(format!("{}m", size_mib))
+        .arg("-V")
+        .arg(format!("{}m", size_mib))
         .arg(name)
         .output()?;
 
@@ -861,7 +873,8 @@ fn exists_zvol(name: &str) -> Result<bool> {
         .env_clear()
         .arg("list")
         .arg("-Hp")
-        .arg("-o").arg("name,type")
+        .arg("-o")
+        .arg("name,type")
         .output()?;
 
     if !output.status.success() {
@@ -888,9 +901,7 @@ fn exists_zvol(name: &str) -> Result<bool> {
 }
 
 fn swapadd() -> Result<()> {
-    let output = std::process::Command::new(SWAPADD)
-        .env_clear()
-        .output()?;
+    let output = std::process::Command::new(SWAPADD).env_clear().output()?;
 
     if !output.status.success() {
         bail!("swapadd failed: {}", output.info());
@@ -927,7 +938,11 @@ fn ensure_interface_name(log: &Logger, name: &str, mac_addres: &str) -> Result<(
     Ok(())
 }
 
-fn ensure_ipadm_subnets_config(log: &Logger, link_name: &str, subnets: &Vec<NetworkDataV1Subnet>) -> Result<()> {
+fn ensure_ipadm_subnets_config(
+    log: &Logger,
+    link_name: &str,
+    subnets: &Vec<NetworkDataV1Subnet>,
+) -> Result<()> {
     info!(log, "configuring subnets for link {}", link_name);
     for subnet in subnets {
         if let Err(e) = ensure_ipadm_single_subnet_config(log, link_name, subnet) {
@@ -938,7 +953,11 @@ fn ensure_ipadm_subnets_config(log: &Logger, link_name: &str, subnets: &Vec<Netw
     Ok(())
 }
 
-fn ensure_ipadm_single_subnet_config(log: &Logger, link_name: &str, subnet: &NetworkDataV1Subnet) -> Result<()> {
+fn ensure_ipadm_single_subnet_config(
+    log: &Logger,
+    link_name: &str,
+    subnet: &NetworkDataV1Subnet,
+) -> Result<()> {
     match subnet {
         NetworkDataV1Subnet::Dhcp4 | NetworkDataV1Subnet::Dhcp => {
             ensure_ipv4_interface_dhcp(log, "dhcp4", link_name)
@@ -972,7 +991,12 @@ fn ensure_ipadm_single_subnet_config(log: &Logger, link_name: &str, subnet: &Net
             }
 
             if let Some(routes) = &conf.routes {
-                error!(log, "route configuration not yet wupported, cannot apply {:#?} to link {}", routes, link_name);
+                error!(
+                    log,
+                    "route configuration not yet wupported, cannot apply {:#?} to link {}",
+                    routes,
+                    link_name
+                );
             }
 
             Ok(())
@@ -1063,9 +1087,7 @@ fn ensure_ipv4_gateway(log: &Logger, gateway: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str)
-    -> Result<()>
-{
+fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str) -> Result<()> {
     info!(log, "ENSURE IPv4 DHCP INTERFACE: {}", n);
 
     ensure_ipadm_interface(log, &n)?;
@@ -1090,7 +1112,10 @@ fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str)
     }
 
     if name_found && !address_found {
-        info!(log, "ipadm address exists but with wrong IP address, deleting");
+        info!(
+            log,
+            "ipadm address exists but with wrong IP address, deleting"
+        );
         let output = Command::new(IPADM)
             .env_clear()
             .arg("delete-addr")
@@ -1107,9 +1132,11 @@ fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str)
         let output = Command::new(IPADM)
             .env_clear()
             .arg("create-addr")
-            .arg("-T").arg("dhcp")
+            .arg("-T")
+            .arg("dhcp")
             .arg("-1")
-            .arg("-w").arg("10")
+            .arg("-w")
+            .arg("10")
             .arg(&targname)
             .output()?;
 
@@ -1129,8 +1156,10 @@ fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str)
 
         if let Some(addr) = addr {
             if addr.state == "ok" {
-                info!(log, "ok, interface {} address {} ({}) complete",
-                    n, addr.cidr, sfx);
+                info!(
+                    log,
+                    "ok, interface {} address {} ({}) complete", n, addr.cidr, sfx
+                );
                 return Ok(());
             }
         } else {
@@ -1142,17 +1171,20 @@ fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str)
     }
 }
 
-fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac_option: Option<&str>, link_name: Option<&str>, ipv4: &str)
-    -> Result<()>
-{
-
+fn ensure_ipv4_interface(
+    log: &Logger,
+    sfx: &str,
+    mac_option: Option<&str>,
+    link_name: Option<&str>,
+    ipv4: &str,
+) -> Result<()> {
     let found_nic = if let Some(mac) = mac_option {
         match mac_to_nic(mac)? {
             None => bail!("MAC address {} not found", mac),
             Some(n) => {
                 info!(log, "MAC address {} is NIC {}", mac, n);
                 n
-            },
+            }
         }
     } else if let Some(name) = link_name {
         String::from(name)
@@ -1186,7 +1218,10 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac_option: Option<&str>, link
     }
 
     if name_found && !address_found {
-        info!(log, "ipadm address exists but with wrong IP address, deleting");
+        info!(
+            log,
+            "ipadm address exists but with wrong IP address, deleting"
+        );
         let output = Command::new(IPADM)
             .env_clear()
             .arg("delete-addr")
@@ -1203,18 +1238,27 @@ fn ensure_ipv4_interface(log: &Logger, sfx: &str, mac_option: Option<&str>, link
         let output = Command::new(IPADM)
             .env_clear()
             .arg("create-addr")
-            .arg("-T").arg("static")
-            .arg("-a").arg(ipv4)
+            .arg("-T")
+            .arg("static")
+            .arg("-a")
+            .arg(ipv4)
             .arg(&targname)
             .output()?;
 
         if !output.status.success() {
-            bail!("ipadm create-addr {} {}: {}", &targname, ipv4,
-                output.info());
+            bail!(
+                "ipadm create-addr {} {}: {}",
+                &targname,
+                ipv4,
+                output.info()
+            );
         }
     }
 
-    info!(log, "ok, interface {} address {} ({}) complete", found_nic, ipv4, sfx);
+    info!(
+        log,
+        "ok, interface {} address {} ({}) complete", found_nic, ipv4, sfx
+    );
     Ok(())
 }
 
@@ -1250,7 +1294,9 @@ fn run(log: &Logger) -> Result<()> {
      * First, expand the ZFS pool.  We can do this prior to metadata access.
      */
     phase_expand_zpool(log)?;
-    phase_add_swap(log).map_err(|e| error!(log, "add swap failed: {}", e)).ok();
+    phase_add_swap(log)
+        .map_err(|e| error!(log, "add swap failed: {}", e))
+        .ok();
 
     /*
      * Try first to use SMBIOS information to determine what kind of hypervisor
@@ -1284,16 +1330,12 @@ fn run(log: &Logger) -> Result<()> {
             }
             ("OmniOS", "OmniOS HVM") | ("OpenIndiana", "OpenIndiana HVM") => {
                 info!(log, "hypervisor type: illumos BHYVE (from SMBIOS)");
-                /*
-                 * Skip networking under OmniOS for now, until we figure out the
-                 * appropriate strategy for configuring networking in the guest.
-                 */
                 run_illumos(log, &smbios.uuid)?;
                 return Ok(());
             }
             ("QEMU", _) => {
                 info!(log, "hypervisor type: Generic QEMU (from SMBIOS)");
-                run_generic(log, &smbios.uuid, true)?;
+                run_illumos(log, &smbios.uuid)?;
                 return Ok(());
             }
             ("VMware, Inc.", "VMware Virtual Platform") => {
@@ -1341,12 +1383,19 @@ fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<()> {
      */
     if let Some([id]) = read_lines(STAMP)?.as_deref() {
         if id.trim() == smbios_uuid {
-            info!(log, "this guest has already completed first \
-                boot processing, halting");
+            info!(
+                log,
+                "this guest has already completed first \
+                boot processing, halting"
+            );
             return Ok(());
         } else {
-            info!(log, "guest UUID changed ({} -> {}), reprocessing",
-                id.trim(), smbios_uuid);
+            info!(
+                log,
+                "guest UUID changed ({} -> {}), reprocessing",
+                id.trim(),
+                smbios_uuid
+            );
         }
     }
 
@@ -1366,7 +1415,8 @@ fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<()> {
         let cpio = Command::new(CPIO)
             .arg("-i")
             .arg("-q")
-            .arg("-I").arg(&dev)
+            .arg("-I")
+            .arg(&dev)
             .current_dir(UNPACKDIR)
             .env_clear()
             .output()?;
@@ -1425,7 +1475,7 @@ fn run_generic(log: &Logger, smbios_uuid: &str, network: bool) -> Result<()> {
      */
     let keys = format!("{}/authorized_keys", UNPACKDIR);
     if let Some(keys) = read_lines(&keys)? {
-        ensure_pubkeys(log, "root",keys.as_slice())?;
+        ensure_pubkeys(log, "root", keys.as_slice())?;
     }
 
     /*
@@ -1465,7 +1515,10 @@ fn parse_smbios_datasource_string(raw_string: &str) -> Result<SMBIOSDatasource> 
     Ok(ds)
 }
 
-fn ensure_network_config(log: &Logger, config: &userdata::networkconfig::NetworkConfig) -> Result<()> {
+fn ensure_network_config(
+    log: &Logger,
+    config: &userdata::networkconfig::NetworkConfig,
+) -> Result<()> {
     let net_config = match config {
         userdata::networkconfig::NetworkConfig::V1(c) => &c.config,
         userdata::networkconfig::NetworkConfig::V2(_) => {
@@ -1477,7 +1530,12 @@ fn ensure_network_config(log: &Logger, config: &userdata::networkconfig::Network
     // First configure the Physical Interfaces
     for iface_config in net_config {
         match iface_config {
-            NetworkDataV1Iface::Physical { name, mac_address: mac_address_option, mtu: mtu_option, subnets: subnet_option } => {
+            NetworkDataV1Iface::Physical {
+                name,
+                mac_address: mac_address_option,
+                mtu: mtu_option,
+                subnets: subnet_option,
+            } => {
                 // First we make sure the Interface is named correctly
                 // if we have a mac address set. Thus making
                 // the optional mac address attribute the
@@ -1520,7 +1578,7 @@ fn ensure_network_config(log: &Logger, config: &userdata::networkconfig::Network
     //Configure Routes
     for iface_config in net_config {
         match iface_config {
-            NetworkDataV1Iface::Route {..} => {
+            NetworkDataV1Iface::Route { .. } => {
                 bail!("routes not yet supported")
             }
             _ => {}
@@ -1530,7 +1588,9 @@ fn ensure_network_config(log: &Logger, config: &userdata::networkconfig::Network
     //Finaly configure nameservers
     for iface_config in net_config {
         match iface_config {
-            NetworkDataV1Iface::Nameserver { address, search, .. } => {
+            NetworkDataV1Iface::Nameserver {
+                address, search, ..
+            } => {
                 ensure_dns_nameservers(log, address)?;
                 ensure_dns_search(log, search)?;
             }
@@ -1553,12 +1613,19 @@ fn run_illumos(log: &Logger, smbios_raw_string: &str) -> Result<()> {
      */
     if let Some([id]) = read_lines(STAMP)?.as_deref() {
         if id.trim() == ds.uuid {
-            info!(log, "this guest has already completed first \
-                boot processing, halting");
+            info!(
+                log,
+                "this guest has already completed first \
+                boot processing, halting"
+            );
             return Ok(());
         } else {
-            info!(log, "guest UUID changed ({} -> {}), reprocessing",
-                id.trim(), ds.uuid);
+            info!(
+                log,
+                "guest UUID changed ({} -> {}), reprocessing",
+                id.trim(),
+                ds.uuid
+            );
         }
     }
 
@@ -1575,7 +1642,8 @@ fn run_illumos(log: &Logger, smbios_raw_string: &str) -> Result<()> {
             info!(log, "mounting cidata device {} to {}", dev.path, UNPACKDIR);
             ensure_dir(log, UNPACKDIR)?;
             let mount = Command::new(MOUNT)
-                .arg("-F").arg(&dev.fstype)
+                .arg("-F")
+                .arg(&dev.fstype)
                 .arg(&dev.path)
                 .arg(UNPACKDIR)
                 .env_clear()
@@ -1586,7 +1654,6 @@ fn run_illumos(log: &Logger, smbios_raw_string: &str) -> Result<()> {
             }
 
             info!(log, "ok, disk mounted");
-
         }
     } else {
         bail!("could not find a cidata device bailing")
@@ -1597,8 +1664,8 @@ fn run_illumos(log: &Logger, smbios_raw_string: &str) -> Result<()> {
     let user_data = read_user_data(log, &dir_buf.join("user-data"))?;
 
     let meta_data_file = File::open(&dir_buf.join("meta-data"))?;
-    let meta_data = serde_yaml::from_reader::<File, userdata::cloudconfig::Metadata>(meta_data_file)?;
-
+    let meta_data =
+        serde_yaml::from_reader::<File, userdata::cloudconfig::Metadata>(meta_data_file)?;
 
     /*
      * Get a system hostname from the metadata, if provided.  Make sure to set
@@ -1607,7 +1674,8 @@ fn run_illumos(log: &Logger, smbios_raw_string: &str) -> Result<()> {
      */
     phase_set_hostname(log, meta_data.get_hostname())?;
 
-    let network_config_result = userdata::networkconfig::parse_network_config( &dir_buf.join("network-config"));
+    let network_config_result =
+        userdata::networkconfig::parse_network_config(&dir_buf.join("network-config"));
     // Apply network config if we have one.
     if network_config_result.is_ok() {
         ensure_network_config(&log, &network_config_result?)?;
@@ -1647,7 +1715,6 @@ fn run_illumos(log: &Logger, smbios_raw_string: &str) -> Result<()> {
      * User data phase
      */
     phase_user_data(log, &user_data)?;
-
 
     for script in user_data.scripts {
         /*
@@ -1719,12 +1786,19 @@ fn run_amazon(log: &Logger) -> Result<()> {
      */
     if let Some([id]) = read_lines(STAMP)?.as_deref() {
         if id.trim() == instid {
-            info!(log, "this guest has already completed first \
-                boot processing, halting");
+            info!(
+                log,
+                "this guest has already completed first \
+                boot processing, halting"
+            );
             return Ok(());
         } else {
-            info!(log, "guest Instance ID changed ({} -> {}), reprocessing",
-                id.trim(), instid);
+            info!(
+                log,
+                "guest Instance ID changed ({} -> {}), reprocessing",
+                id.trim(),
+                instid
+            );
         }
     }
 
@@ -1748,7 +1822,7 @@ fn run_amazon(log: &Logger) -> Result<()> {
      */
     if let Some(pk) = amazon_metadata_get(log, "public-keys/0/openssh-key")? {
         let pubkeys = vec![pk];
-        ensure_pubkeys(log, "root",&pubkeys)?;
+        ensure_pubkeys(log, "root", &pubkeys)?;
     } else {
         warn!(log, "no SSH public key?");
     }
@@ -1758,7 +1832,8 @@ fn run_amazon(log: &Logger) -> Result<()> {
      */
     if let Some(userscript) = amazon_metadata_getx(log, "user-data")? {
         phase_userscript(log, &userscript)
-            .map_err(|e| error!(log, "failed to get user-script: {}", e)).ok();
+            .map_err(|e| error!(log, "failed to get user-script: {}", e))
+            .ok();
     } else {
         info!(log, "no user-data?");
     }
@@ -1780,12 +1855,19 @@ fn run_smartos(log: &Logger) -> Result<()> {
      */
     if let Some([id]) = read_lines(STAMP)?.as_deref() {
         if id.trim() == uuid {
-            info!(log, "this guest has already completed first \
-                boot processing, halting");
+            info!(
+                log,
+                "this guest has already completed first \
+                boot processing, halting"
+            );
             return Ok(());
         } else {
-            info!(log, "guest UUID changed ({} -> {}), reprocessing",
-                id.trim(), uuid);
+            info!(
+                log,
+                "guest UUID changed ({} -> {}), reprocessing",
+                id.trim(),
+                uuid
+            );
         }
     }
 
@@ -1802,7 +1884,9 @@ fn run_smartos(log: &Logger) -> Result<()> {
         uuid
     } else {
         bail!("could not get hostname or alias or UUID for this VM");
-    }.trim().to_string();
+    }
+    .trim()
+    .to_string();
     info!(log, "VM node name is \"{}\"", n);
     phase_set_hostname(log, &n)?;
 
@@ -1818,16 +1902,13 @@ fn run_smartos(log: &Logger) -> Result<()> {
                     /*
                      * XXX handle these.
                      */
-                    error!(log, "interface {} requires {} support",
-                        nic.interface, ip);
+                    error!(log, "interface {} requires {} support", nic.interface, ip);
                     continue;
                 }
 
                 let sfx = format!("ip{}", i);
 
-                if let Err(e) = ensure_ipv4_interface(log, &sfx, Some(&nic.mac),
-                    None, &ip)
-                {
+                if let Err(e) = ensure_ipv4_interface(log, &sfx, Some(&nic.mac), None, &ip) {
                     error!(log, "IFACE {}/{} ERROR: {}", nic.interface, sfx, e);
                 }
             }
@@ -1855,11 +1936,9 @@ fn run_smartos(log: &Logger) -> Result<()> {
      * Get public keys:
      */
     if let Mdata::Found(pubkeys) = mdata_get(log, "root_authorized_keys")? {
-        let pubkeys: Vec<String> = pubkeys.lines()
-            .map(|s| s.trim().to_string())
-            .collect();
+        let pubkeys: Vec<String> = pubkeys.lines().map(|s| s.trim().to_string()).collect();
 
-        ensure_pubkeys(log, "root",&pubkeys)?;
+        ensure_pubkeys(log, "root", &pubkeys)?;
     }
 
     /*
@@ -1867,7 +1946,8 @@ fn run_smartos(log: &Logger) -> Result<()> {
      */
     if let Mdata::Found(userscript) = mdata_get(log, "user-script")? {
         phase_userscript(log, &userscript)
-            .map_err(|e| error!(log, "failed to get user-script: {}", e)).ok();
+            .map_err(|e| error!(log, "failed to get user-script: {}", e))
+            .ok();
     }
 
     write_lines(log, STAMP, &[uuid])?;
@@ -1882,8 +1962,10 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
      * this droplet or not.
      */
     let mounts = mounts()?;
-    let mdmp: Vec<_> = mounts.iter()
-        .filter(|m| { m.mount_point == MOUNTPOINT }).collect();
+    let mdmp: Vec<_> = mounts
+        .iter()
+        .filter(|m| m.mount_point == MOUNTPOINT)
+        .collect();
 
     let do_mount = match mdmp.as_slice() {
         [] => true,
@@ -1914,7 +1996,8 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
 
         let output = Command::new(MOUNT)
             .env_clear()
-            .arg("-F").arg("hsfs")
+            .arg("-F")
+            .arg("hsfs")
             .arg(dev)
             .arg(MOUNTPOINT)
             .output()?;
@@ -1929,8 +2012,7 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
     /*
      * Read metadata from the file system:
      */
-    let md: Option<DOMetadata> = read_json(
-        &format!("{}/digitalocean_meta_data.json", MOUNTPOINT))?;
+    let md: Option<DOMetadata> = read_json(&format!("{}/digitalocean_meta_data.json", MOUNTPOINT))?;
 
     let md = if let Some(md) = md {
         md
@@ -1947,12 +2029,19 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
         let expected = md.droplet_id.to_string();
 
         if id.trim() == expected {
-            info!(log, "this droplet has already completed first \
-                boot processing, halting");
+            info!(
+                log,
+                "this droplet has already completed first \
+                boot processing, halting"
+            );
             return Ok(());
         } else {
-            info!(log, "droplet ID changed ({} -> {}), reprocessing",
-                id.trim(), expected);
+            info!(
+                log,
+                "droplet ID changed ({} -> {}), reprocessing",
+                id.trim(),
+                expected
+            );
         }
     }
 
@@ -1967,8 +2056,8 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
             continue;
         }
 
-        if let Err(e) = ensure_ipv4_interface(log, "private", Some(&iface.mac),
-            None, &iface.ipv4.cidr()?)
+        if let Err(e) =
+            ensure_ipv4_interface(log, "private", Some(&iface.mac), None, &iface.ipv4.cidr()?)
         {
             /*
              * Report the error, but drive on in case we can complete other
@@ -1983,8 +2072,8 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
             continue;
         }
 
-        if let Err(e) = ensure_ipv4_interface(log, "public", Some(&iface.mac),
-            None, &iface.ipv4.cidr()?)
+        if let Err(e) =
+            ensure_ipv4_interface(log, "public", Some(&iface.mac), None, &iface.ipv4.cidr()?)
         {
             /*
              * Report the error, but drive on in case we can complete other
@@ -1998,8 +2087,8 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
         }
 
         if let Some(anchor) = &iface.anchor_ipv4 {
-            if let Err(e) = ensure_ipv4_interface(log, "anchor", Some(&iface.mac),
-                None, &anchor.cidr()?)
+            if let Err(e) =
+                ensure_ipv4_interface(log, "anchor", Some(&iface.mac), None, &anchor.cidr()?)
             {
                 error!(log, "ANCHOR IFACE ERROR: {}", e);
             }
@@ -2007,7 +2096,7 @@ fn run_digitalocean(log: &Logger) -> Result<()> {
     }
 
     ensure_dns_nameservers(log, &md.dns.nameservers)?;
-    ensure_pubkeys(log, "root",md.public_keys.as_slice())?;
+    ensure_pubkeys(log, "root", md.public_keys.as_slice())?;
 
     /*
      * Get userscript:
@@ -2114,21 +2203,17 @@ fn phase_set_hostname(log: &Logger, hostname: &str) -> Result<()> {
     if write_nodename {
         info!(log, "WRITE NODENAME \"{}\"", hostname);
 
-        let status = Command::new(HOSTNAME)
-            .env_clear()
-            .arg(hostname)
-            .status()?;
+        let status = Command::new(HOSTNAME).env_clear().arg(hostname).status()?;
 
         if !status.success() {
-             error!(log, "could not set live system hostname");
+            error!(log, "could not set live system hostname");
         }
 
         /*
          * Write the file after we set the live system hostname, so that if we
          * are restarted we don't forget to do that part.
          */
-        write_lines(log, "/etc/nodename", &[ hostname ])?;
-
+        write_lines(log, "/etc/nodename", &[hostname])?;
     } else {
         info!(log, "NODENAME \"{}\" OK ALREADY", hostname);
     }
@@ -2137,60 +2222,59 @@ fn phase_set_hostname(log: &Logger, hostname: &str) -> Result<()> {
      * Write /etc/hosts file with new nodename...
      */
     let hosts = read_lines("/etc/inet/hosts")?.unwrap();
-    let hostsout: Vec<String> = hosts.iter().map(|l| {
-        /*
-         * Split the line into a substantive portion and an optional comment.
-         */
-        let sect: Vec<&str> = l.splitn(2, '#').collect();
-
-        let mut fore = sect[0].to_string();
-
-        if !sect[0].trim().is_empty() {
+    let hostsout: Vec<String> = hosts
+        .iter()
+        .map(|l| {
             /*
-             * If the line has a substantive portion, split that into an IP
-             * address and a set of host names:
+             * Split the line into a substantive portion and an optional comment.
              */
-            let portions: Vec<&str> = sect[0]
-                .splitn(2, |c| c == ' ' || c == '\t')
-                .collect();
+            let sect: Vec<&str> = l.splitn(2, '#').collect();
 
-            if portions.len() > 1 {
+            let mut fore = sect[0].to_string();
+
+            if !sect[0].trim().is_empty() {
                 /*
-                 * Rewrite only the localhost entry, to include the system node
-                 * name.  This essentially matches the OmniOS out-of-box file
-                 * contents.
+                 * If the line has a substantive portion, split that into an IP
+                 * address and a set of host names:
                  */
-                if portions[0] == "127.0.0.1" || portions[0] == "::1" {
-                    let mut hosts = String::new();
-                    hosts.push_str(portions[0]);
-                    if portions[0] == "::1" {
-                        hosts.push('\t');
-                    }
-                    hosts.push_str("\tlocalhost");
-                    if portions[0] == "127.0.0.1" {
-                        hosts.push_str(" loghost");
-                    }
-                    hosts.push_str(&format!(" {}.local {}",
-                        hostname, hostname));
+                let portions: Vec<&str> = sect[0].splitn(2, |c| c == ' ' || c == '\t').collect();
 
-                    fore = hosts;
+                if portions.len() > 1 {
+                    /*
+                     * Rewrite only the localhost entry, to include the system node
+                     * name.  This essentially matches the OmniOS out-of-box file
+                     * contents.
+                     */
+                    if portions[0] == "127.0.0.1" || portions[0] == "::1" {
+                        let mut hosts = String::new();
+                        hosts.push_str(portions[0]);
+                        if portions[0] == "::1" {
+                            hosts.push('\t');
+                        }
+                        hosts.push_str("\tlocalhost");
+                        if portions[0] == "127.0.0.1" {
+                            hosts.push_str(" loghost");
+                        }
+                        hosts.push_str(&format!(" {}.local {}", hostname, hostname));
+
+                        fore = hosts;
+                    }
                 }
             }
-        }
 
-        if sect.len() > 1 {
-            format!("{}#{}", fore, sect[1])
-        } else {
-            fore
-        }
-    }).collect();
+            if sect.len() > 1 {
+                format!("{}#{}", fore, sect[1])
+            } else {
+                fore
+            }
+        })
+        .collect();
     write_lines(log, "/etc/inet/hosts", &hostsout)?;
 
     Ok(())
 }
 
 fn phase_user_data(log: &Logger, user_data: &UserData) -> Result<()> {
-
     //First Apply cloud configurations
     for cc in user_data.cloud_configs.clone() {
         /*
@@ -2298,14 +2382,20 @@ fn ensure_write_file(log: &Logger, file: &WriteFileData) -> Result<()> {
     }
 
     if let Some(mode_string) = &file.permissions {
-        info!(log, "setting permissions of file {} to {}", file.path, mode_string);
+        info!(
+            log,
+            "setting permissions of file {} to {}", file.path, mode_string
+        );
         let meta = &f.metadata()?;
         let mut perms = meta.permissions();
         perms.set_mode(mode_string.parse::<u32>()?);
     }
 
     if let Some(owner) = &file.owner {
-        info!(log, "setting owner and group of file {} to {}", file.path, owner);
+        info!(
+            log,
+            "setting owner and group of file {} to {}", file.path, owner
+        );
         let mut uid: users::uid_t;
         let mut gid: users::gid_t;
         if owner.contains(":") {
@@ -2340,7 +2430,12 @@ fn ensure_write_file(log: &Logger, file: &WriteFileData) -> Result<()> {
 }
 
 /// Actually perform the change of owner on a path
-fn chown<P: AsRef<Path>>(path: P, uid: libc::uid_t, gid: libc::gid_t, follow: bool) -> IOResult<()> {
+fn chown<P: AsRef<Path>>(
+    path: P,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    follow: bool,
+) -> IOResult<()> {
     let path = path.as_ref();
     let s = CString::new(path.as_os_str().as_bytes()).unwrap();
     let ret = unsafe {
@@ -2356,7 +2451,6 @@ fn chown<P: AsRef<Path>>(path: P, uid: libc::uid_t, gid: libc::gid_t, follow: bo
         Err(IOError::last_os_error())
     }
 }
-
 
 fn ensure_dns_nameservers(log: &Logger, nameservers: &[String]) -> Result<()> {
     /*
@@ -2380,9 +2474,7 @@ fn ensure_dns_nameservers(log: &Logger, nameservers: &[String]) -> Result<()> {
 
     for l in &lines {
         let ll: Vec<_> = l.splitn(2, ' ').collect();
-        if ll.len() == 2 && ll[0] == "nameserver" &&
-            !nameservers.contains(&ll[1].to_string())
-        {
+        if ll.len() == 2 && ll[0] == "nameserver" && !nameservers.contains(&ll[1].to_string()) {
             info!(log, "REMOVE DNS CONFIG LINE: {}", l);
             file.push(format!("#{}", l));
             dirty = true;
@@ -2420,9 +2512,7 @@ fn ensure_dns_search(log: &Logger, dns_search: &[String]) -> Result<()> {
 
     for l in &lines {
         let ll: Vec<_> = l.splitn(2, ' ').collect();
-        if ll.len() == 2 && ll[0] == "search" &&
-            !dns_search.contains(&ll[1].to_string())
-        {
+        if ll.len() == 2 && ll[0] == "search" && !dns_search.contains(&ll[1].to_string()) {
             info!(log, "REMOVE DNS Search CONFIG LINE: {}", l);
             file.push(format!("#{}", l));
             dirty = true;
@@ -2520,7 +2610,6 @@ fn ensure_user(log: &Logger, user: &UserConfig) -> Result<()> {
         if !output.status.success() {
             bail!("useradd failed for {}: {}", &user.name, output.info());
         }
-
     } else {
         info!(log, "user with name {} exists skipping", &user.name);
     }
@@ -2548,21 +2637,32 @@ fn ensure_group(log: &Logger, groups: HashMap<String, Option<Vec<String>>>) -> R
 
         if let Some(users_in_group) = users_in_group_opt {
             for user in users_in_group {
-                let existing_groups: Vec<String> = if let Some(sys_user) = users::get_user_by_name(&user) {
-                    if let Some(user_groups) = users::get_user_groups(&user, sys_user.primary_group_id()) {
-                        user_groups.iter().map(|g|
-                            g.name().to_os_string().into_string().unwrap_or(String::new())
-                        ).collect()
+                let existing_groups: Vec<String> =
+                    if let Some(sys_user) = users::get_user_by_name(&user) {
+                        if let Some(user_groups) =
+                            users::get_user_groups(&user, sys_user.primary_group_id())
+                        {
+                            user_groups
+                                .iter()
+                                .map(|g| {
+                                    g.name()
+                                        .to_os_string()
+                                        .into_string()
+                                        .unwrap_or(String::new())
+                                })
+                                .collect()
+                        } else {
+                            vec![]
+                        }
                     } else {
                         vec![]
-                    }
-                } else {
-                    vec![]
-                };
+                    };
 
-                let mut user_groups: Vec<String> = existing_groups.iter().filter(|&g|
-                    g.clone() != String::new()
-                ).map(|g| g.clone()).collect();
+                let mut user_groups: Vec<String> = existing_groups
+                    .iter()
+                    .filter(|&g| g.clone() != String::new())
+                    .map(|g| g.clone())
+                    .collect();
 
                 user_groups.push(group_name.clone());
                 let mut cmd = Command::new(USERMOD);
