@@ -6,7 +6,6 @@
 
 mod common;
 mod file;
-mod public_keys;
 mod userdata;
 mod zpool;
 
@@ -16,21 +15,20 @@ use flate2::read::GzDecoder;
 use libc;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ffi::{CString, OsStr, OsString};
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::prelude::*;
+use std::ffi::CString;
+use std::fs::{self, File, OpenOptions};
+
 use std::io::Error as IOError;
 use std::io::Result as IOResult;
-use std::io::{copy as IOCopy, BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{copy as IOCopy, BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use userdata::read_user_data;
 use users;
-use users::User;
 
 use crate::userdata::cloudconfig::{UserConfig, WriteFileData, WriteFileEncoding};
 use crate::userdata::multiformat_deserialize::Multiformat;
@@ -274,6 +272,7 @@ enum MountOptionValue {
     Value(String),
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct Mount {
     special: String,
@@ -288,6 +287,7 @@ struct DNS {
     nameservers: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct FloatingIP {
     active: bool,
@@ -339,6 +339,7 @@ struct Interfaces {
     private: Option<Vec<Interface>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct DOMetadata {
     auth_key: String,
@@ -353,6 +354,7 @@ struct DOMetadata {
     user_data: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SdcNic {
     mac: String,
@@ -1638,7 +1640,7 @@ fn run_illumos(log: &Logger, smbios_raw_string: &str) -> Result<()> {
     info!(log, "searching for cidata device with metadata...");
     let devs_opt = find_cidata_devices(log)?;
     if let Some(devs) = devs_opt {
-        for dev in devs {
+        if let Some(dev) = devs.first() {
             info!(log, "mounting cidata device {} to {}", dev.path, UNPACKDIR);
             ensure_dir(log, UNPACKDIR)?;
             let mount = Command::new(MOUNT)
@@ -2368,7 +2370,7 @@ fn ensure_write_file(log: &Logger, file: &WriteFileData) -> Result<()> {
         }
         WriteFileEncoding::Gzip => {
             trace!(log, "writing gzip encoded data");
-            let mut content_clone = file.content.clone();
+            let content_clone = file.content.clone();
             let mut conent_bytes = content_clone.as_str().as_bytes();
             let mut d = GzDecoder::new(BufReader::new(&mut conent_bytes));
             IOCopy(&mut d, &mut w)?;
@@ -2396,7 +2398,9 @@ fn ensure_write_file(log: &Logger, file: &WriteFileData) -> Result<()> {
             log,
             "setting owner and group of file {} to {}", file.path, owner
         );
+        #[allow(unused_mut)]
         let mut uid: users::uid_t;
+        #[allow(unused_mut)]
         let mut gid: users::gid_t;
         if owner.contains(":") {
             if let Some((u, g)) = owner.split_once(":") {

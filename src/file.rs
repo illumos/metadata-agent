@@ -3,17 +3,15 @@
  */
 
 use crate::common::*;
+use anyhow::Result;
 use std::fs::{DirBuilder, File};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::io::{ErrorKind, BufReader, BufRead, copy as IOCopy, Read, Write};
-use anyhow::{Result};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::DirBuilderExt;
 
 pub fn ensure_dir(log: &Logger, path: &str) -> Result<()> {
     if !exists_dir(path)? {
         info!(log, "mkdir {}", path);
-        DirBuilder::new()
-            .mode(0o700)
-            .create(path)?;
+        DirBuilder::new().mode(0o700).create(path)?;
     }
     Ok(())
 }
@@ -50,11 +48,8 @@ pub fn exists_file(p: &str) -> Result<bool> {
     Ok(true)
 }
 
-
 pub fn read_lines(p: &str) -> Result<Option<Vec<String>>> {
-    Ok(read_file(p)?.map(|data| {
-        data.lines().map(|a| a.trim().to_string()).collect()
-    }))
+    Ok(read_file(p)?.map(|data| data.lines().map(|a| a.trim().to_string()).collect()))
 }
 
 pub fn read_lines_maybe(p: &str) -> Result<Vec<String>> {
@@ -64,9 +59,7 @@ pub fn read_lines_maybe(p: &str) -> Result<Vec<String>> {
     })
 }
 
-pub
-
-fn read_file(p: &str) -> Result<Option<String>> {
+pub fn read_file(p: &str) -> Result<Option<String>> {
     let f = match File::open(p) {
         Ok(f) => f,
         Err(e) => {
@@ -94,7 +87,8 @@ pub fn write_file(p: &str, data: &str) -> Result<()> {
 }
 
 pub fn write_lines<L>(log: &Logger, p: &str, lines: &[L]) -> Result<()>
-    where L: AsRef<str> + std::fmt::Debug
+where
+    L: AsRef<str> + std::fmt::Debug,
 {
     info!(log, "----- WRITE FILE: {} ------ {:#?}", p, lines);
     let mut out = String::new();

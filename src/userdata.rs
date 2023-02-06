@@ -2,36 +2,34 @@
  * Copyright 2021 OpenFlowLabs
  *
  */
+use crate::common::*;
+use anyhow::Result;
 use cloudconfig::CloudConfig;
-use std::io::prelude::*;
 use flate2::read::GzDecoder;
+use std::fs::File;
+use std::io::prelude::*;
 use std::io::BufReader;
 use std::path::PathBuf;
-use std::fs::File;
-use crate::common::*;
-use anyhow::{Result};
-use thiserror::{Error};
+use thiserror::Error;
 
 pub mod cloudconfig;
-pub mod networkconfig;
 pub mod multiformat_deserialize;
+pub mod networkconfig;
 
 pub fn read_user_data(log: &Logger, path: &PathBuf) -> Result<UserData> {
     // Parse Multipart message from stream
     match read_gz_data(log, path) {
         Ok(data) => Ok(data),
-        Err(err) => {
-            match err.downcast::<UserDataError>() {
-                Ok(uerr) => {
-                    if uerr == UserDataError::NotGzData {
-                        Ok(read_uncompressed(log, path)?)
-                    } else {
-                        Err(uerr)?
-                    }
+        Err(err) => match err.downcast::<UserDataError>() {
+            Ok(uerr) => {
+                if uerr == UserDataError::NotGzData {
+                    Ok(read_uncompressed(log, path)?)
+                } else {
+                    Err(uerr)?
                 }
-                Err(oerr) => Err(oerr)
             }
-        }
+            Err(oerr) => Err(oerr),
+        },
     }
 }
 
@@ -51,7 +49,6 @@ fn read_uncompressed(log: &Logger, path: &PathBuf) -> Result<UserData> {
 }
 
 fn parse_user_data_multipart_stream<S: BufRead>(log: &Logger, stream: &mut S) -> Result<UserData> {
-
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf)?;
 
@@ -74,9 +71,7 @@ fn parse_file_part(log: &Logger, d: &mut UserData, mime_type: &str, buf: &str) -
             let cc = serde_yaml::from_str::<CloudConfig>(buf)?;
             d.cloud_configs.push(cc);
         }
-        "text/x-shellscript" => {
-            d.scripts.push(buf.into())
-        }
+        "text/x-shellscript" => d.scripts.push(buf.into()),
         _ => {
             info!(log, "unsupported mime type {}, skipping", mime_type);
         }
@@ -87,10 +82,6 @@ fn parse_file_part(log: &Logger, d: &mut UserData, mime_type: &str, buf: &str) -
 
 #[derive(Debug, Error, PartialEq)]
 enum UserDataError {
-    #[error("format of file {} is not parseable", path)]
-    InvalidFile{
-        path: String,
-    },
     #[error("file is not compressed")]
     NotGzData,
 }
@@ -103,15 +94,18 @@ pub struct UserData {
 
 #[cfg(test)]
 mod tests {
+    use crate::common::init_log;
+    use crate::userdata::UserData;
     use std::path::PathBuf;
     use std::str::FromStr;
-    use crate::userdata::UserData;
-    use crate::common::init_log;
 
     #[test]
     fn multipart_parse() {
         let log = init_log();
-        let res = crate::userdata::read_user_data(&log, &PathBuf::from_str("./sample_data/mime_message.txt").unwrap());
+        let res = crate::userdata::read_user_data(
+            &log,
+            &PathBuf::from_str("./sample_data/mime_message.txt").unwrap(),
+        );
         let udata = res.unwrap();
         assert_ne!(udata, UserData::default());
     }
@@ -119,7 +113,10 @@ mod tests {
     #[test]
     fn userdata_parse() {
         let log = init_log();
-        let res = crate::userdata::read_user_data(&log, &PathBuf::from_str("./sample_data/user-data").unwrap());
+        let res = crate::userdata::read_user_data(
+            &log,
+            &PathBuf::from_str("./sample_data/user-data").unwrap(),
+        );
         let udata = res.unwrap();
         assert_ne!(udata, UserData::default());
     }

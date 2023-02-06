@@ -2,9 +2,9 @@
  * Copyright 2021 OpenFlowLabs
  *
  */
-use std::collections::HashMap;
-use serde::{Deserialize};
 use crate::userdata::multiformat_deserialize::Multiformat;
+use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Default, Debug, Clone, Deserialize, Eq, PartialEq)]
 pub struct Metadata {
@@ -39,6 +39,7 @@ impl Metadata {
         ""
     }
 
+    #[allow(dead_code)]
     pub fn get_public_hostname(&self) -> &str {
         if let Some(name) = &self.public_hostname {
             return name;
@@ -105,7 +106,7 @@ pub enum GrowPartMode {
     #[serde(rename = "growpart")]
     Growpart,
     #[serde(rename = "off")]
-    Off
+    Off,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
@@ -122,7 +123,7 @@ pub enum PowerStateMode {
     #[serde(rename = "halt")]
     Halt,
     #[serde(rename = "reboot")]
-    Reboot
+    Reboot,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
@@ -154,7 +155,7 @@ pub enum WriteFileEncoding {
     None,
     B64,
     Gzip,
-    B64Gzip
+    B64Gzip,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
