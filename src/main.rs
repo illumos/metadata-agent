@@ -6,45 +6,30 @@
 
 mod common;
 mod file;
+#[allow(dead_code)]
 mod userdata;
 mod zpool;
 
+#[allow(dead_code)]
+use crate::userdata::networkconfig::{NetworkDataV1Iface, NetworkDataV1Subnet};
 use anyhow::Result;
-use base64::decode as base64Decode;
-use flate2::read::GzDecoder;
-use libc;
+use common::*;
+use file::*;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-
-use std::io::Error as IOError;
-use std::io::Result as IOResult;
-use std::io::{copy as IOCopy, BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::net::Ipv4Addr;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use userdata::read_user_data;
-use users;
-
-use crate::userdata::cloudconfig::{UserConfig, WriteFileData, WriteFileEncoding};
-use crate::userdata::multiformat_deserialize::Multiformat;
-use crate::userdata::networkconfig::{NetworkDataV1Iface, NetworkDataV1Subnet};
-use crate::userdata::UserData;
-use common::*;
-use file::*;
 
 const METADATA_DIR: &str = "/var/metadata";
 const STAMP: &str = "/var/metadata/stamp";
 const USERSCRIPT: &str = "/var/metadata/userscript";
 const MOUNTPOINT: &str = "/var/metadata/iso";
 const UNPACKDIR: &str = "/var/metadata/files";
-
 const DEFROUTER: &str = "/etc/defaultrouter";
-
 const DHCPINFO: &str = "/sbin/dhcpinfo";
 const DLADM: &str = "/usr/sbin/dladm";
 const FSTYP: &str = "/usr/sbin/fstyp";
@@ -58,11 +43,6 @@ const SVCADM: &str = "/usr/sbin/svcadm";
 const SWAPADD: &str = "/sbin/swapadd";
 const ZFS: &str = "/sbin/zfs";
 const CPIO: &str = "/usr/bin/cpio";
-const PKG: &str = "/usr/bin/pkg";
-const USERADD: &str = "/usr/sbin/useradd";
-const GROUPADD: &str = "/usr/sbin/groupadd";
-const USERMOD: &str = "/usr/sbin/usermod";
-
 const FMRI_USERSCRIPT: &str = "svc:/system/illumos/userscript:default";
 
 #[derive(Debug)]
@@ -1663,8 +1643,6 @@ fn run_illumos(log: &Logger, smbios_raw_string: &str) -> Result<()> {
 
     let dir_buf = PathBuf::from(UNPACKDIR);
 
-    let user_data = read_user_data(log, &dir_buf.join("user-data"))?;
-
     let meta_data_file = File::open(&dir_buf.join("meta-data"))?;
     let meta_data =
         serde_yaml::from_reader::<File, userdata::cloudconfig::Metadata>(meta_data_file)?;
@@ -1711,18 +1689,6 @@ fn run_illumos(log: &Logger, smbios_raw_string: &str) -> Result<()> {
         } else {
             bail!("could not find an appropriate Ethernet interface!");
         }
-    }
-
-    /*
-     * User data phase
-     */
-    phase_user_data(log, &user_data)?;
-
-    for script in user_data.scripts {
-        /*
-         * handle the userscripts we have in the user-data:
-         */
-        phase_userscript(log, &script)?;
     }
 
     write_lines(log, STAMP, &[ds.uuid])?;
@@ -2276,186 +2242,6 @@ fn phase_set_hostname(log: &Logger, hostname: &str) -> Result<()> {
     Ok(())
 }
 
-fn phase_user_data(log: &Logger, user_data: &UserData) -> Result<()> {
-    //First Apply cloud configurations
-    for cc in user_data.cloud_configs.clone() {
-        /*
-         * First Apply the groups
-         */
-        if let Some(groups) = cc.groups {
-            for group in groups {
-                ensure_group(log, group)?;
-            }
-        }
-
-        for user in cc.users {
-            ensure_user(log, &user)?;
-        }
-
-        if let Some(files) = cc.write_files {
-            for file in files {
-                ensure_write_file(log, &file)?;
-            }
-        }
-
-        /*
-        if let Some(ca_certs) = cc.ca_certs {
-
-        }
-        */
-
-        if let Some(packages) = cc.packages {
-            match packages {
-                Multiformat::String(pkg) => {
-                    ensure_packages(&log, vec![pkg])?;
-                }
-                Multiformat::List(pkgs) => {
-                    ensure_packages(&log, pkgs)?;
-                }
-                _ => {}
-            }
-        }
-
-        /*
-         * Set general ssh Authorized keys
-         */
-        if let Some(keys) = cc.ssh_authorized_keys {
-            ensure_pubkeys(log, "root", &keys)?;
-        }
-    }
-
-    //Then run the scripts
-
-    Ok(())
-}
-
-fn ensure_packages(log: &&Logger, pkgs: Vec<String>) -> Result<()> {
-    info!(log, "installing packages {:#?}", pkgs);
-    let mut pkg_cmd = Command::new(PKG);
-    pkg_cmd.env_clear();
-    pkg_cmd.arg("install");
-    pkg_cmd.arg("-v");
-
-    for pkg in pkgs {
-        pkg_cmd.arg(pkg);
-    }
-
-    let mut child = pkg_cmd.spawn()?;
-    let status = child.wait()?;
-    if !status.success() {
-        bail!("failed package installation see log messages above")
-    }
-
-    info!(log, "packages installed");
-    Ok(())
-}
-
-fn ensure_write_file(log: &Logger, file: &WriteFileData) -> Result<()> {
-    info!(log, "creating file {}", file.path);
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&file.path)?;
-    let mut w = std::io::BufWriter::new(&f);
-
-    match file.encoding {
-        WriteFileEncoding::None => {
-            trace!(log, "writing string data");
-            w.write_all(file.content.as_bytes())?;
-        }
-        WriteFileEncoding::B64 => {
-            trace!(log, "writing base64 encoded data");
-            w.write_all(base64Decode(&file.content)?.as_slice())?;
-        }
-        WriteFileEncoding::Gzip => {
-            trace!(log, "writing gzip encoded data");
-            let content_clone = file.content.clone();
-            let mut conent_bytes = content_clone.as_str().as_bytes();
-            let mut d = GzDecoder::new(BufReader::new(&mut conent_bytes));
-            IOCopy(&mut d, &mut w)?;
-        }
-        WriteFileEncoding::B64Gzip => {
-            trace!(log, "writing gzipped base64 encoded data");
-            let decoded_content = base64Decode(&file.content)?;
-            let mut d = GzDecoder::new(decoded_content.as_slice());
-            IOCopy(&mut d, &mut w)?;
-        }
-    }
-
-    if let Some(mode_string) = &file.permissions {
-        info!(
-            log,
-            "setting permissions of file {} to {}", file.path, mode_string
-        );
-        let meta = &f.metadata()?;
-        let mut perms = meta.permissions();
-        perms.set_mode(mode_string.parse::<u32>()?);
-    }
-
-    if let Some(owner) = &file.owner {
-        info!(
-            log,
-            "setting owner and group of file {} to {}", file.path, owner
-        );
-        #[allow(unused_mut)]
-        let mut uid: users::uid_t;
-        #[allow(unused_mut)]
-        let mut gid: users::gid_t;
-        if owner.contains(":") {
-            if let Some((u, g)) = owner.split_once(":") {
-                if let Some(user) = users::get_user_by_name(u) {
-                    uid = user.uid();
-                } else {
-                    bail!("could not find user {} in system", u)
-                }
-
-                if let Some(group) = users::get_group_by_name(g) {
-                    gid = group.gid();
-                } else {
-                    bail!("could not find group {} in system", g)
-                }
-            } else {
-                bail!("wrong user group string invalid config")
-            }
-        } else {
-            let meta = f.metadata()?;
-            gid = meta.gid();
-            if let Some(u) = users::get_user_by_name(&owner) {
-                uid = u.uid();
-            } else {
-                bail!("could not find user {} in system", &owner)
-            }
-        }
-        chown(&file.path, uid, gid, false)?;
-    }
-
-    Ok(())
-}
-
-/// Actually perform the change of owner on a path
-fn chown<P: AsRef<Path>>(
-    path: P,
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-    follow: bool,
-) -> IOResult<()> {
-    let path = path.as_ref();
-    let s = CString::new(path.as_os_str().as_bytes()).unwrap();
-    let ret = unsafe {
-        if follow {
-            libc::chown(s.as_ptr(), uid, gid)
-        } else {
-            libc::lchown(s.as_ptr(), uid, gid)
-        }
-    };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(IOError::last_os_error())
-    }
-}
-
 fn ensure_dns_nameservers(log: &Logger, nameservers: &[String]) -> Result<()> {
     /*
      * DNS Servers:
@@ -2562,124 +2348,6 @@ fn ensure_pubkeys(log: &Logger, user: &str, public_keys: &[String]) -> Result<()
 
     if dirty {
         write_lines(log, &authorized_keys, file.as_ref())?;
-    }
-
-    Ok(())
-}
-
-fn ensure_user(log: &Logger, user: &UserConfig) -> Result<()> {
-    if users::get_user_by_name(&user.name).is_none() {
-        let mut cmd = Command::new(USERADD);
-        if let Some(groups) = &user.groups {
-            cmd.arg("-G").arg(groups.join(","));
-        }
-
-        if let Some(expire_date) = &user.expire_date {
-            cmd.arg("-e").arg(expire_date);
-        }
-
-        if let Some(gecos) = &user.gecos {
-            cmd.arg("-c").arg(gecos);
-        }
-
-        if let Some(home_dir) = &user.homedir {
-            cmd.arg("-d").arg(home_dir);
-        }
-
-        if let Some(primary_group) = &user.primary_group {
-            cmd.arg("-g").arg(primary_group);
-        } else if let Some(no_user_group) = &user.no_user_group {
-            if !no_user_group {
-                let mut ump = HashMap::<String, Option<Vec<String>>>::new();
-                ump.insert(user.name.clone(), Some(vec![]));
-                ensure_group(log, ump)?;
-            }
-        }
-
-        if let Some(inactive) = &user.inactive {
-            cmd.arg("-f").arg(inactive);
-        }
-
-        if let Some(shell) = &user.shell {
-            cmd.arg("-s").arg(shell);
-        }
-
-        cmd.arg(&user.name);
-
-        //TODO lock_passwd
-        //TODO passwd
-        //TODO is_system_user
-        debug!(log, "Running useradd {:?}", cmd);
-        let output = cmd.output()?;
-        if !output.status.success() {
-            bail!("useradd failed for {}: {}", &user.name, output.info());
-        }
-    } else {
-        info!(log, "user with name {} exists skipping", &user.name);
-    }
-
-    if let Some(public_keys) = &user.ssh_authorized_keys {
-        ensure_pubkeys(log, &user.name, public_keys)?;
-    }
-
-    Ok(())
-}
-
-fn ensure_group(log: &Logger, groups: HashMap<String, Option<Vec<String>>>) -> Result<()> {
-    for (group_name, users_in_group_opt) in groups {
-        if users::get_group_by_name(&group_name).is_none() {
-            let mut cmd = Command::new(GROUPADD);
-            cmd.arg(&group_name);
-            debug!(log, "Running groupadd {:?}", cmd);
-            let output = cmd.output()?;
-            if !output.status.success() {
-                bail!("groupadd failed for {}: {}", &group_name, output.info());
-            }
-        } else {
-            info!(log, "group {} exists", group_name)
-        }
-
-        if let Some(users_in_group) = users_in_group_opt {
-            for user in users_in_group {
-                let existing_groups: Vec<String> =
-                    if let Some(sys_user) = users::get_user_by_name(&user) {
-                        if let Some(user_groups) =
-                            users::get_user_groups(&user, sys_user.primary_group_id())
-                        {
-                            user_groups
-                                .iter()
-                                .map(|g| {
-                                    g.name()
-                                        .to_os_string()
-                                        .into_string()
-                                        .unwrap_or(String::new())
-                                })
-                                .collect()
-                        } else {
-                            vec![]
-                        }
-                    } else {
-                        vec![]
-                    };
-
-                let mut user_groups: Vec<String> = existing_groups
-                    .iter()
-                    .filter(|&g| g.clone() != String::new())
-                    .map(|g| g.clone())
-                    .collect();
-
-                user_groups.push(group_name.clone());
-                let mut cmd = Command::new(USERMOD);
-                cmd.arg("-G");
-                cmd.arg(user_groups.clone().join(","));
-                cmd.arg(&user);
-                debug!(log, "Running usermod {:?}", cmd);
-                let output = cmd.output()?;
-                if !output.status.success() {
-                    bail!("usermod failed for {}: {}", &user, output.info());
-                }
-            }
-        }
     }
 
     Ok(())

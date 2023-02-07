@@ -11,7 +11,7 @@ use std::os::unix::fs::DirBuilderExt;
 pub fn ensure_dir(log: &Logger, path: &str) -> Result<()> {
     if !exists_dir(path)? {
         info!(log, "mkdir {}", path);
-        DirBuilder::new().mode(0o700).create(path)?;
+        DirBuilder::new().recursive(true).mode(0o700).create(path)?;
     }
     Ok(())
 }
