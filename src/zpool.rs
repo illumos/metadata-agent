@@ -7,9 +7,15 @@ use std::io::Write;
 
 use super::common::*;
 
-pub fn fmthard(log: &Logger, disk: &str, part: &str, tag: &str, flag: &str,
-    start: u64, size: u64) -> Result<()>
-{
+pub fn fmthard(
+    log: &Logger,
+    disk: &str,
+    part: &str,
+    tag: &str,
+    flag: &str,
+    start: u64,
+    size: u64,
+) -> Result<()> {
     let cmd = format!("{}:{}:{}:{}:{}", part, tag, flag, start, size);
     let path = format!("/dev/rdsk/{}p0", disk);
 
@@ -17,7 +23,8 @@ pub fn fmthard(log: &Logger, disk: &str, part: &str, tag: &str, flag: &str,
 
     let output = std::process::Command::new("/usr/sbin/fmthard")
         .env_clear()
-        .arg("-d").arg(cmd)
+        .arg("-d")
+        .arg(cmd)
         .arg(path)
         .output()?;
 
@@ -110,12 +117,13 @@ pub fn zpool_disk() -> Result<String> {
         bail!("zpool list unexpected results: {:?}", lines);
     }
 
-    let terms: Vec<_> = lines.iter().map(|l| {
-        l.split('\t').collect::<Vec<_>>()
-    }).collect();
+    let terms: Vec<_> =
+        lines.iter().map(|l| l.split('\t').collect::<Vec<_>>()).collect();
 
-    if terms[0].is_empty() || terms[0][0] != pool ||
-        terms[1].len() < 2 || terms[1][0] != ""
+    if terms[0].is_empty()
+        || terms[0][0] != pool
+        || terms[1].len() < 2
+        || terms[1][0] != ""
     {
         bail!("zpool list unexpected results: {:?}", terms);
     }
@@ -187,14 +195,17 @@ fn prtvtoc(disk: &str) -> Result<Vtoc> {
 
                 let t: Vec<_> = l.trim().split_whitespace().collect();
 
-                parts.insert(t[0].to_string(), Partition {
-                    id: t[0].to_string(),
-                    tag: t[1].to_string(),
-                    flags: t[2].to_string(),
-                    sector_first: t[3].parse().unwrap(),
-                    sector_count: t[4].parse().unwrap(),
-                    sector_last: t[5].parse().unwrap(),
-                });
+                parts.insert(
+                    t[0].to_string(),
+                    Partition {
+                        id: t[0].to_string(),
+                        tag: t[1].to_string(),
+                        flags: t[2].to_string(),
+                        sector_first: t[3].parse().unwrap(),
+                        sector_count: t[4].parse().unwrap(),
+                        sector_last: t[5].parse().unwrap(),
+                    },
+                );
             }
         }
     }
@@ -230,8 +241,10 @@ pub fn format_expand(log: &Logger, disk: &str) -> Result<()> {
         .env_clear()
         .env("NOINUSE_CHECK", "1")
         .env("_LIBDISKMGT_INSTALL", "1")
-        .arg("-d").arg(disk)
-        .arg("-f").arg(tf.path().to_str().unwrap())
+        .arg("-d")
+        .arg(disk)
+        .arg("-f")
+        .arg(tf.path().to_str().unwrap())
         .output()?;
 
     if !output.status.success() {
@@ -314,8 +327,15 @@ pub fn grow_data_partition(log: &Logger, disk: &str) -> Result<()> {
     let delta = reserved.sector_first - 1 - data.sector_last;
 
     info!(log, "growing data partition...");
-    fmthard(log, disk, &data.id, &data.tag, &data.flags,
-        data.sector_first, data.sector_count + delta)?;
+    fmthard(
+        log,
+        disk,
+        &data.id,
+        &data.tag,
+        &data.flags,
+        data.sector_first,
+        data.sector_count + delta,
+    )?;
     info!(log, "partition growth ok");
 
     Ok(())
