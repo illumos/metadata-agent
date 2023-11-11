@@ -1,6 +1,8 @@
 /*
- * Copyright 2020 Oxide Computer Company
+ * Copyright 2023 Oxide Computer Company
  */
+
+#![allow(unused_imports)]
 
 use std::collections::HashMap;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -16,6 +18,7 @@ use serde::Deserialize;
 use std::net::Ipv4Addr;
 
 mod common;
+mod provider;
 mod zpool;
 use common::*;
 
@@ -32,7 +35,6 @@ const DLADM: &str = "/usr/sbin/dladm";
 const FSTYP: &str = "/usr/sbin/fstyp";
 const HOSTNAME: &str = "/usr/bin/hostname";
 const IPADM: &str = "/usr/sbin/ipadm";
-const MDATA_GET: &str = "/usr/sbin/mdata-get";
 const MOUNT: &str = "/sbin/mount";
 const PRTCONF: &str = "/usr/sbin/prtconf";
 const SMBIOS: &str = "/usr/sbin/smbios";
@@ -49,38 +51,6 @@ struct Smbios {
     product: String,
     version: String,
     uuid: String,
-}
-
-fn amazon_metadata_getx(log: &Logger, key: &str) -> Result<Option<String>> {
-    let url = format!("http://169.254.169.254/latest/{}", key);
-
-    let cb = reqwest::blocking::ClientBuilder::new()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-
-    loop {
-        match cb.get(&url).send() {
-            Ok(res) => {
-                if res.status().is_success() {
-                    let val = res.text()?.trim_end_matches('\n').to_string();
-                    return Ok(Some(val));
-                } else if res.status().as_u16() == 404 {
-                    return Ok(None);
-                }
-
-                error!(log, "metadata {}: bad status {}", key, res.status());
-            }
-            Err(e) => {
-                error!(log, "metadata {}: bad status {}", key, e);
-            }
-        }
-
-        sleep(5_000);
-    }
-}
-
-fn amazon_metadata_get(log: &Logger, key: &str) -> Result<Option<String>> {
-    amazon_metadata_getx(log, &format!("meta-data/{}", key))
 }
 
 fn smf_enable(log: &Logger, fmri: &str) -> Result<()> {
@@ -150,72 +120,6 @@ fn smbios(log: &Logger) -> Result<Option<Smbios>> {
         }
 
         Ok(Some(Smbios { manufacturer: m, product: p, version: v, uuid: u }))
-    }
-}
-
-enum Mdata {
-    Found(String),
-    NotFound,
-    WrongHypervisor,
-}
-
-fn mdata_get(log: &Logger, key: &str) -> Result<Mdata> {
-    info!(log, "mdata-get \"{}\"...", key);
-    let output = Command::new(MDATA_GET).env_clear().arg(key).output()?;
-
-    Ok(match output.status.code() {
-        Some(0) => {
-            let out = String::from_utf8(output.stdout)?
-                .trim_end_matches('\n')
-                .to_string();
-            info!(log, "mdata for \"{}\" -> \"{}\"", key, out);
-            Mdata::Found(out)
-        }
-        Some(1) => {
-            warn!(log, "mdata for \"{}\" not found", key);
-            Mdata::NotFound
-        }
-        Some(2) => {
-            /*
-             * An unexpected permanent failure occurred, which likely means we
-             * cannot use "mdata-get" for metadata on this system.  Assume this
-             * is not a SmartOS system.
-             */
-            warn!(log, "mdata wrong hypervisor: {}", output.info());
-            Mdata::WrongHypervisor
-        }
-        _ => bail!("mdata-get: unexpected failure: {}", output.info()),
-    })
-}
-
-fn mdata_probe(log: &Logger) -> Result<bool> {
-    /*
-     * Check for an mdata-get(1M) binary on this system:
-     */
-    if !exists_file(MDATA_GET)? {
-        /*
-         * If the program is not there at all, this is not an image for a guest
-         * on a SmartOS hypervisor.
-         */
-        return Ok(false);
-    }
-
-    match mdata_get(log, "sdc:uuid")? {
-        Mdata::Found(_) | Mdata::NotFound => {
-            /*
-             * Whether found or not found, we were able to speak to the
-             * hypervisor.  Treat this as a SmartOS system.
-             */
-            Ok(true)
-        }
-        Mdata::WrongHypervisor => {
-            /*
-             * An unexpected permanent failure occurred, which likely means we
-             * cannot use "mdata-get" for metadata on this system.  Assume this
-             * is not a SmartOS system.
-             */
-            Ok(false)
-        }
     }
 }
 
@@ -321,99 +225,8 @@ struct Mount {
     time: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct Dns {
-    nameservers: Vec<String>,
-}
-
-#[allow(unused)]
-#[derive(Debug, Deserialize)]
-struct FloatingIP {
-    active: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct IPv4 {
-    ip_address: String,
-    gateway: String,
-    netmask: String,
-}
-
-impl IPv4 {
-    fn prefix_len(&self) -> Result<u32> {
-        let nm: Ipv4Addr = self.netmask.parse()?;
-        let bits: u32 = nm.into();
-
-        if bits.leading_zeros() != 0 {
-            bail!("bits not left packed in {}", self.netmask);
-        }
-
-        let len = bits.count_ones();
-        if bits.trailing_zeros() != 32 - len {
-            bail!("bits not contiguous in {}", self.netmask);
-        }
-        assert_eq!(32 - len, bits.trailing_zeros());
-
-        Ok(len)
-    }
-
-    fn cidr(&self) -> Result<String> {
-        let prefix_len = self.prefix_len()?;
-        Ok(format!("{}/{}", self.ip_address, prefix_len))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct Interface {
-    anchor_ipv4: Option<IPv4>,
-    ipv4: IPv4,
-    mac: String,
-    #[serde(rename = "type")]
-    type_: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Interfaces {
-    public: Option<Vec<Interface>>,
-    private: Option<Vec<Interface>>,
-}
-
-#[allow(unused)]
-#[derive(Debug, Deserialize)]
-struct Metadata {
-    auth_key: String,
-    dns: Dns,
-    droplet_id: u64,
-    floating_ip: FloatingIP,
-    interfaces: Interfaces,
-    hostname: String,
-    public_keys: Vec<String>,
-    region: String,
-    features: HashMap<String, bool>,
-    user_data: Option<String>,
-}
-
-#[allow(unused)]
-#[derive(Debug, Deserialize)]
-struct SdcNic {
-    mac: String,
-    interface: String,
-    #[serde(default)]
-    ips: Vec<String>,
-    #[serde(default)]
-    gateways: Vec<String>,
-    primary: Option<bool>,
-    nic_tag: Option<String>,
-}
-
-impl SdcNic {
-    fn primary(&self) -> bool {
-        self.primary.unwrap_or(false)
-    }
-}
-
 /**
- * Read mnttab(4) and produce a list of mounts.  The result is a list instead of
+ * Read mnttab(5) and produce a list of mounts.  The result is a list instead of
  * a dictionary as there may be more than one mount entry for a particular mount
  * point.
  */
@@ -492,74 +305,7 @@ fn exists_file(p: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn detect_archive<P: AsRef<Path>>(rdevpath: P) -> Result<Option<String>> {
-    let mut buf = [0u8; 512];
-    let mut f = OpenOptions::new()
-        .read(true)
-        .write(false)
-        .append(false)
-        .truncate(false)
-        .open(rdevpath.as_ref())?;
-    f.read_exact(&mut buf)?;
-    if buf[0] == 0xC7 && buf[1] == 0x71 {
-        /*
-         * Binary header (octal 070707)
-         */
-        Ok(Some("cpio".to_string()))
-    } else if &buf[0..6] == b"070707" {
-        /*
-         * ASCII header
-         */
-        Ok(Some("cpio".to_string()))
-    } else {
-        Ok(None)
-    }
-}
-
-fn find_cpio_device(log: &Logger) -> Result<Option<String>> {
-    /*
-     * Use the raw device so that we can read just enough bytes to look for the
-     * cpio magic:
-     */
-    let i = std::fs::read_dir("/dev/rdsk")?;
-
-    let mut out = Vec::new();
-
-    for ent in i {
-        let ent = ent?;
-
-        if let Some(name) = ent.file_name().to_str() {
-            if !name.ends_with("p0") {
-                continue;
-            }
-        } else {
-            continue;
-        }
-
-        match detect_archive(&ent.path()) {
-            Ok(Some(archive)) => {
-                if &archive == "cpio" {
-                    out.push(ent.path());
-                }
-            }
-            Err(e) => warn!(
-                log,
-                "detecting archive on {}: {:?}",
-                ent.path().display(),
-                e
-            ),
-            _ => {}
-        }
-    }
-
-    match out.len() {
-        0 => Ok(None),
-        1 => Ok(Some(out[0].to_str().unwrap().to_string())),
-        n => bail!("found {} cpio archive devices", n),
-    }
-}
-
-fn find_device() -> Result<Option<String>> {
+fn find_device(fstyp: &str) -> Result<Option<String>> {
     let i = std::fs::read_dir("/dev/dsk")?;
 
     let mut out = Vec::new();
@@ -586,7 +332,7 @@ fn find_device() -> Result<Option<String>> {
         }
 
         if let Ok(s) = String::from_utf8(output.stdout) {
-            if s.trim() == "hsfs" {
+            if s.trim() == fstyp {
                 out.push(ent.path());
             }
         }
@@ -595,7 +341,7 @@ fn find_device() -> Result<Option<String>> {
     match out.len() {
         0 => Ok(None),
         1 => Ok(Some(out[0].to_str().unwrap().to_string())),
-        n => bail!("found {} hsfs file systems", n),
+        n => bail!("found {} {fstyp} file systems", n),
     }
 }
 
@@ -1111,39 +857,39 @@ fn run(log: &Logger) -> Result<()> {
         match (smbios.manufacturer.as_str(), smbios.product.as_str()) {
             ("Joyent", "SmartDC HVM") => {
                 info!(log, "hypervisor type: SmartOS (from SMBIOS)");
-                run_smartos(log)?;
+                provider::smartos::run(log)?;
                 return Ok(());
             }
             ("DigitalOcean", "Droplet") => {
                 info!(log, "hypervisor type: DigitalOcean (from SMBIOS)");
-                run_digitalocean(log)?;
+                provider::digitalocean::run(log)?;
                 return Ok(());
             }
             ("Xen", "HVM domU") => {
                 if smbios.version.contains("amazon") {
                     info!(log, "hypervisor type: Amazon AWS Xen (from SMBIOS)");
-                    run_amazon(log)?;
+                    provider::amazon::run(log)?;
                     return Ok(());
                 }
             }
             ("Amazon EC2", _) => {
                 info!(log, "hypervisor type: Amazon AWS Nitro (from SMBIOS)");
-                run_amazon(log)?;
+                provider::amazon::run(log)?;
                 return Ok(());
             }
             ("OmniOS", "OmniOS HVM") => {
                 info!(log, "hypervisor type: OmniOS BHYVE (from SMBIOS)");
-                run_generic(log, &smbios.uuid)?;
+                provider::generic::run(log, &smbios.uuid)?;
                 return Ok(());
             }
             ("QEMU", _) => {
                 info!(log, "hypervisor type: Generic QEMU (from SMBIOS)");
-                run_generic(log, &smbios.uuid)?;
+                provider::generic::run(log, &smbios.uuid)?;
                 return Ok(());
             }
             ("VMware, Inc.", "VMware Virtual Platform") => {
                 info!(log, "hypervisor type: VMware (from SMBIOS)");
-                run_generic(log, &smbios.uuid)?;
+                provider::generic::run(log, &smbios.uuid)?;
                 return Ok(());
             }
             _ => {}
@@ -1164,9 +910,9 @@ fn run(log: &Logger) -> Result<()> {
      *
      * First, we'll look for the SmartOS metadata commands and see if they work:
      */
-    if mdata_probe(log)? {
+    if provider::smartos::mdata_probe(log)? {
         info!(log, "hypervisor type: SmartOS (mdata probe)");
-        run_smartos(log)?;
+        provider::smartos::run(log)?;
         return Ok(());
     }
 
@@ -1175,10 +921,9 @@ fn run(log: &Logger) -> Result<()> {
      * instructions:
      */
     info!(log, "looking for cpio devices...");
-    let dev = find_cpio_device(log)?;
-    if let Some(dev) = dev {
-        info!(log, "hypervisor type: Generic (probed cpio {})", dev);
-        run_generic(log, &uuid)?;
+    if provider::generic::cpio_probe(log)? {
+        info!(log, "hypervisor type: Generic (probed cpio)");
+        provider::generic::run(log, &uuid)?;
         return Ok(());
     }
 
@@ -1187,10 +932,9 @@ fn run(log: &Logger) -> Result<()> {
      * Ocean.  In future we could more generically look for cloud-init metadata.
      */
     info!(log, "looking for hsfs devices...");
-    let dev = find_device()?;
-    if let Some(dev) = dev {
-        info!(log, "hypervisor type: DigitalOcean (probed hsfs {})", dev);
-        run_digitalocean(log)?;
+    if provider::digitalocean::hsfs_probe()? {
+        info!(log, "hypervisor type: DigitalOcean (probed hsfs)");
+        provider::digitalocean::run(log)?;
         return Ok(());
     }
 
@@ -1198,526 +942,6 @@ fn run(log: &Logger) -> Result<()> {
      * Otherwise, we don't know what to do.
      */
     error!(log, "no metadata source found; giving up!");
-    Ok(())
-}
-
-fn run_generic(log: &Logger, smbios_uuid: &str) -> Result<()> {
-    /*
-     * Load our stamp file to see if the Guest UUID has changed.
-     */
-    if let Some([id]) = read_lines(STAMP)?.as_deref() {
-        if id.trim() == smbios_uuid {
-            info!(
-                log,
-                "this guest has already completed first \
-                boot processing, halting"
-            );
-            return Ok(());
-        } else {
-            info!(
-                log,
-                "guest UUID changed ({} -> {}), reprocessing",
-                id.trim(),
-                smbios_uuid
-            );
-        }
-    }
-
-    phase_reguid_zpool(log)?;
-
-    /*
-     * To ease configuration of a guest on a system that lacks a mechanism for
-     * guest metadata services (e.g., QEMU under libvirt on a Linux desktop or
-     * VMware Fusion on a Macintosh) we will try to detect a disk device that
-     * contains a cpio archive with metadata files.
-     */
-    info!(log, "searching for cpio device with metadata...");
-    let dev = find_cpio_device(log)?;
-    if let Some(dev) = &dev {
-        println!("extracting cpio from {} to {}", dev, UNPACKDIR);
-        ensure_dir(log, UNPACKDIR)?;
-        let cpio = Command::new(CPIO)
-            .arg("-i")
-            .arg("-q")
-            .arg("-I")
-            .arg(dev)
-            .current_dir(UNPACKDIR)
-            .env_clear()
-            .output()?;
-
-        if !cpio.status.success() {
-            bail!("cpio failure: {}", cpio.info());
-        }
-
-        info!(log, "ok, cpio extracted");
-    }
-
-    /*
-     * The archive may contain a configuration file that influences our
-     * behaviour.
-     */
-    let c: Config =
-        read_toml(&format!("{}/config.toml", UNPACKDIR))?.unwrap_or_default();
-
-    /*
-     * Get a system hostname from the archive, if provided.  Make sure to set
-     * this before engaging DHCP, so that "virsh net-dhcp-leases default" can
-     * display the hostname in the lease record instead of "unknown".
-     */
-    let name = format!("{}/nodename", UNPACKDIR);
-    if let Some(name) = read_file(&name)? {
-        phase_set_hostname(log, name.trim())?;
-    }
-
-    /*
-     * Get SSH public keys from the archive, if provided.  Do this before we try
-     * to configure networking, in case that is partially successful and having
-     * the keys in place would be helpful for debugging.
-     */
-    let keys = format!("{}/authorized_keys", UNPACKDIR);
-    if let Some(keys) = read_lines(&keys)? {
-        phase_pubkeys(log, keys.as_slice())?;
-    }
-
-    if !c.network.skip {
-        /*
-         * For now, we will configure one NIC with DHCP.  Virtio interfaces are
-         * preferred.
-         */
-        let ifaces = dladm_ether_list()?;
-        let mut chosen = None;
-        info!(log, "found these ethernet interfaces: {:?}", ifaces);
-        /*
-         * Prefer Virtio devices:
-         */
-        for iface in ifaces.iter() {
-            if iface.starts_with("vioif") {
-                chosen = Some(iface.as_str());
-                break;
-            }
-        }
-        /*
-         * Otherwise, use whatever we have:
-         */
-        if chosen.is_none() {
-            chosen = ifaces.first().map(|x| x.as_str());
-        }
-
-        if let Some(chosen) = chosen {
-            info!(log, "chose interface {}", chosen);
-            ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
-        } else {
-            bail!("could not find an appropriate Ethernet interface!");
-        }
-    }
-
-    /*
-     * Get a user-provided first boot script from the archive, if provided:
-     */
-    let script = format!("{}/firstboot.sh", UNPACKDIR);
-    if let Some(script) = read_file(&script)? {
-        phase_userscript(log, &script)?;
-    }
-
-    write_lines(log, STAMP, &[smbios_uuid])?;
-
-    Ok(())
-}
-
-fn run_amazon(log: &Logger) -> Result<()> {
-    /*
-     * Sadly, Amazon has no mechanism for metadata access that does not require
-     * a correctly configured IP interface.  In addition, the available NIC
-     * depends on at least the instance type, if not other configuration.  Find
-     * the right interface for DHCP:
-     */
-    let ifaces = dladm_ether_list()?;
-    let mut chosen = None;
-    info!(log, "found these ethernet interfaces: {:?}", ifaces);
-    /*
-     * Prefer ENA devices:
-     */
-    for iface in ifaces.iter() {
-        if iface.starts_with("ena") {
-            chosen = Some(iface.as_str());
-            break;
-        }
-    }
-    /*
-     * If there is no ENA, try for a Xen interface:
-     */
-    if chosen.is_none() {
-        for iface in ifaces.iter() {
-            if iface.starts_with("xnf") {
-                chosen = Some(iface.as_str());
-                break;
-            }
-        }
-    }
-    /*
-     * Otherwise, use whatever we have:
-     */
-    if chosen.is_none() {
-        chosen = ifaces.first().map(|x| x.as_str());
-    }
-
-    if let Some(chosen) = chosen {
-        info!(log, "chose interface {}", chosen);
-        ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
-    } else {
-        bail!("could not find an appropriate Ethernet interface!");
-    }
-
-    /*
-     * Determine the instance ID, using the metadata service:
-     */
-    let instid = if let Some(id) = amazon_metadata_get(log, "instance-id")? {
-        id
-    } else {
-        bail!("could not determine instance ID");
-    };
-
-    /*
-     * Load our stamp file to see if the Instance ID has changed.
-     */
-    if let Some([id]) = read_lines(STAMP)?.as_deref() {
-        if id.trim() == instid {
-            info!(
-                log,
-                "this guest has already completed first \
-                boot processing, halting"
-            );
-            return Ok(());
-        } else {
-            info!(
-                log,
-                "guest Instance ID changed ({} -> {}), reprocessing",
-                id.trim(),
-                instid
-            );
-        }
-    }
-
-    phase_reguid_zpool(log)?;
-
-    /*
-     * Determine the node name for this guest:
-     */
-    let (src, n) = if let Some(hostname) = dhcpinfo(log, "hostname")? {
-        ("DHCP", hostname.trim().to_string())
-    } else if let Some(hostname) = amazon_metadata_get(log, "hostname")? {
-        ("metadata", hostname.trim().to_string())
-    } else {
-        bail!("could not get hostname for this VM");
-    };
-    info!(log, "VM node name is \"{}\" (from {})", n, src);
-    phase_set_hostname(log, &n)?;
-
-    /*
-     * Get public key:
-     */
-    if let Some(pk) = amazon_metadata_get(log, "public-keys/0/openssh-key")? {
-        let pubkeys = vec![pk];
-        phase_pubkeys(log, &pubkeys)?;
-    } else {
-        warn!(log, "no SSH public key?");
-    }
-
-    /*
-     * Get user script:
-     */
-    if let Some(userscript) = amazon_metadata_getx(log, "user-data")? {
-        phase_userscript(log, &userscript)
-            .map_err(|e| error!(log, "failed to get user-script: {}", e))
-            .ok();
-    } else {
-        info!(log, "no user-data?");
-    }
-
-    write_lines(log, STAMP, &[instid])?;
-
-    Ok(())
-}
-
-fn run_smartos(log: &Logger) -> Result<()> {
-    let uuid = if let Mdata::Found(uuid) = mdata_get(log, "sdc:uuid")? {
-        uuid.trim().to_string()
-    } else {
-        bail!("could not read Guest UUID");
-    };
-
-    /*
-     * Load our stamp file to see if the Guest UUID has changed.
-     */
-    if let Some([id]) = read_lines(STAMP)?.as_deref() {
-        if id.trim() == uuid {
-            info!(
-                log,
-                "this guest has already completed first \
-                boot processing, halting"
-            );
-            return Ok(());
-        } else {
-            info!(
-                log,
-                "guest UUID changed ({} -> {}), reprocessing",
-                id.trim(),
-                uuid
-            );
-        }
-    }
-
-    phase_reguid_zpool(log)?;
-
-    /*
-     * Determine the node name for this guest:
-     */
-    let n = if let Mdata::Found(hostname) = mdata_get(log, "sdc:hostname")? {
-        hostname
-    } else if let Mdata::Found(alias) = mdata_get(log, "sdc:alias")? {
-        alias
-    } else if let Mdata::Found(uuid) = mdata_get(log, "sdc:uuid")? {
-        uuid
-    } else {
-        bail!("could not get hostname or alias or UUID for this VM");
-    }
-    .trim()
-    .to_string();
-    info!(log, "VM node name is \"{}\"", n);
-    phase_set_hostname(log, &n)?;
-
-    /*
-     * Get network configuration:
-     */
-    if let Mdata::Found(nics) = mdata_get(log, "sdc:nics")? {
-        let nics: Vec<SdcNic> = serde_json::from_str(&nics)?;
-
-        for nic in nics.iter() {
-            for (i, ip) in nic.ips.iter().enumerate() {
-                if ip == "dhcp" || ip == "addrconf" {
-                    /*
-                     * XXX handle these.
-                     */
-                    error!(
-                        log,
-                        "interface {} requires {} support", nic.interface, ip
-                    );
-                    continue;
-                }
-
-                let sfx = format!("ip{}", i);
-
-                if let Err(e) = ensure_ipv4_interface(log, &sfx, &nic.mac, ip)
-                {
-                    error!(log, "IFACE {}/{} ERROR: {}", nic.interface, sfx, e);
-                }
-            }
-
-            if nic.primary() {
-                for gw in nic.gateways.iter() {
-                    if let Err(e) = ensure_ipv4_gateway(log, gw) {
-                        error!(log, "PRIMARY GATEWAY {} ERROR: {}", gw, e);
-                    }
-                }
-            }
-        }
-    }
-
-    /*
-     * Get DNS servers:
-     */
-    if let Mdata::Found(resolvers) = mdata_get(log, "sdc:resolvers")? {
-        let resolvers: Vec<String> = serde_json::from_str(&resolvers)?;
-
-        phase_dns(log, &resolvers)?;
-    }
-
-    /*
-     * Get public keys:
-     */
-    if let Mdata::Found(pubkeys) = mdata_get(log, "root_authorized_keys")? {
-        let pubkeys: Vec<String> =
-            pubkeys.lines().map(|s| s.trim().to_string()).collect();
-
-        phase_pubkeys(log, &pubkeys)?;
-    }
-
-    /*
-     * Get userscript:
-     */
-    if let Mdata::Found(userscript) = mdata_get(log, "user-script")? {
-        phase_userscript(log, &userscript)
-            .map_err(|e| error!(log, "failed to get user-script: {}", e))
-            .ok();
-    }
-
-    write_lines(log, STAMP, &[uuid])?;
-
-    Ok(())
-}
-
-fn run_digitalocean(log: &Logger) -> Result<()> {
-    /*
-     * First, locate and mount the metadata ISO.  We need to load the droplet ID
-     * so that we can determine if we have completed first boot processing for
-     * this droplet or not.
-     */
-    let mounts = mounts()?;
-    let mdmp: Vec<_> =
-        mounts.iter().filter(|m| m.mount_point == MOUNTPOINT).collect();
-
-    let do_mount = match mdmp.as_slice() {
-        [] => true,
-        [m] => {
-            /*
-             * Check the existing mount to see if it is adequate.
-             */
-            if m.fstype != "hsfs" {
-                bail!("INVALID MOUNTED FILE SYSTEM: {:#?}", m);
-            }
-            false
-        }
-        m => {
-            bail!("found these mounts for {}: {:#?}", MOUNTPOINT, m);
-        }
-    };
-
-    if do_mount {
-        info!(log, "need to mount Metadata ISO");
-
-        ensure_dir(log, MOUNTPOINT)?;
-
-        let dev = if let Some(dev) = find_device()? {
-            dev
-        } else {
-            bail!("no hsfs file system found");
-        };
-
-        let output = Command::new(MOUNT)
-            .env_clear()
-            .arg("-F")
-            .arg("hsfs")
-            .arg(dev)
-            .arg(MOUNTPOINT)
-            .output()?;
-
-        if !output.status.success() {
-            bail!("mount: {}", output.info());
-        }
-
-        info!(log, "mount ok at {}", MOUNTPOINT);
-    }
-
-    /*
-     * Read metadata from the file system:
-     */
-    let md: Option<Metadata> =
-        read_json(&format!("{}/digitalocean_meta_data.json", MOUNTPOINT))?;
-
-    let md = if let Some(md) = md {
-        md
-    } else {
-        bail!("could not read metadata file");
-    };
-
-    info!(log, "metadata: {:#?}", md);
-
-    /*
-     * Load our stamp file to see if the Droplet ID has changed.
-     */
-    if let Some([id]) = read_lines(STAMP)?.as_deref() {
-        let expected = md.droplet_id.to_string();
-
-        if id.trim() == expected {
-            info!(
-                log,
-                "this droplet has already completed first \
-                boot processing, halting"
-            );
-            return Ok(());
-        } else {
-            info!(
-                log,
-                "droplet ID changed ({} -> {}), reprocessing",
-                id.trim(),
-                expected
-            );
-        }
-    }
-
-    phase_reguid_zpool(log)?;
-    phase_set_hostname(log, &md.hostname)?;
-
-    /*
-     * Check network configuration:
-     */
-    for iface in md.interfaces.private.as_ref().unwrap_or(&vec![]).iter() {
-        if iface.type_ != "private" {
-            continue;
-        }
-
-        if let Err(e) = ensure_ipv4_interface(
-            log,
-            "private",
-            &iface.mac,
-            &iface.ipv4.cidr()?,
-        ) {
-            /*
-             * Report the error, but drive on in case we can complete other
-             * configuration and make the guest accessible anyway.
-             */
-            error!(log, "PRIV IFACE ERROR: {}", e);
-        }
-    }
-
-    for iface in md.interfaces.public.as_ref().unwrap_or(&vec![]).iter() {
-        if iface.type_ != "public" {
-            continue;
-        }
-
-        if let Err(e) = ensure_ipv4_interface(
-            log,
-            "public",
-            &iface.mac,
-            &iface.ipv4.cidr()?,
-        ) {
-            /*
-             * Report the error, but drive on in case we can complete other
-             * configuration and make the guest accessible anyway.
-             */
-            error!(log, "PUB IFACE ERROR: {}", e);
-        }
-
-        if let Err(e) = ensure_ipv4_gateway(log, &iface.ipv4.gateway) {
-            error!(log, "PUB GATEWAY ERROR: {}", e);
-        }
-
-        if let Some(anchor) = &iface.anchor_ipv4 {
-            if let Err(e) = ensure_ipv4_interface(
-                log,
-                "anchor",
-                &iface.mac,
-                &anchor.cidr()?,
-            ) {
-                error!(log, "ANCHOR IFACE ERROR: {}", e);
-            }
-        }
-    }
-
-    phase_dns(log, &md.dns.nameservers)?;
-    phase_pubkeys(log, md.public_keys.as_slice())?;
-
-    /*
-     * Get userscript:
-     */
-    if let Some(userscript) = md.user_data.as_deref() {
-        phase_userscript(log, userscript)
-            .map_err(|e| error!(log, "failed to get user-script: {}", e))
-            .ok();
-    }
-
-    write_lines(log, STAMP, &[md.droplet_id.to_string()])?;
-
     Ok(())
 }
 
@@ -1732,11 +956,11 @@ fn phase_expand_zpool(log: &Logger) -> Result<()> {
      * NOTE: Though it might seem like we could skip directly to using "zpool
      * online -e ...", there appears to be at least one serious deadlock in this
      * code path.  The relabel operation appears to make the device briefly
-     * unavailable at exactly the moment zpool(1M) then tries to reopen it,
+     * unavailable at exactly the moment zpool(8) then tries to reopen it,
      * which permanently corks access to the pool and hangs the machine.
-     * Instead, we go the long way around and use format(1M) and fmthard(1M) to
+     * Instead, we go the long way around and use format(8) and fmthard(8) to
      * effect our own expansion of the GPT and the slice first, so that
-     * zpool(1M) can skip straight to reopening the device.
+     * zpool(8) can skip straight to reopening the device.
      */
     let disk = zpool::zpool_disk()?;
     info!(log, "rpool disk: {}", disk);
