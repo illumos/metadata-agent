@@ -56,7 +56,7 @@ pub fn zpool_logical_size(pool: &str) -> Result<u64> {
     }
 
     let o = String::from_utf8(output.stdout)?;
-    let t: Vec<_> = o.trim().split_whitespace().collect();
+    let t: Vec<_> = o.split_whitespace().collect();
     if t.len() != 2 {
         bail!("unexpected output: {}", o);
     }
@@ -123,7 +123,7 @@ pub fn zpool_disk() -> Result<String> {
     if terms[0].is_empty()
         || terms[0][0] != pool
         || terms[1].len() < 2
-        || terms[1][0] != ""
+        || !terms[1][0].is_empty()
     {
         bail!("zpool list unexpected results: {:?}", terms);
     }
@@ -193,7 +193,7 @@ fn prtvtoc(disk: &str) -> Result<Vtoc> {
                     continue;
                 }
 
-                let t: Vec<_> = l.trim().split_whitespace().collect();
+                let t: Vec<_> = l.split_whitespace().collect();
 
                 parts.insert(
                     t[0].to_string(),
@@ -262,7 +262,7 @@ pub fn format_expand(log: &Logger, disk: &str) -> Result<()> {
  * format(1M).
  */
 pub fn should_expand(disk: &str) -> Result<bool> {
-    let vtoc = prtvtoc(&disk)?;
+    let vtoc = prtvtoc(disk)?;
 
     if vtoc.sector_size != 512 {
         bail!("only works with 512 byte sectors at the moment");
@@ -290,7 +290,7 @@ pub fn should_expand(disk: &str) -> Result<bool> {
  * Check to see if the data slice should be grown to fill any unallocated space.
  */
 pub fn grow_data_partition(log: &Logger, disk: &str) -> Result<()> {
-    let vtoc = prtvtoc(&disk)?;
+    let vtoc = prtvtoc(disk)?;
 
     if vtoc.sector_size != 512 {
         bail!("only works with 512 byte sectors at the moment");

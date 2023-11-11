@@ -238,7 +238,7 @@ where
     let mut out = String::new();
     for l in lines {
         out.push_str(l.as_ref());
-        out.push_str("\n");
+        out.push('\n');
     }
     write_file(p, &out)
 }
@@ -322,7 +322,7 @@ struct Mount {
 }
 
 #[derive(Debug, Deserialize)]
-struct DNS {
+struct Dns {
     nameservers: Vec<String>,
 }
 
@@ -382,7 +382,7 @@ struct Interfaces {
 #[derive(Debug, Deserialize)]
 struct Metadata {
     auth_key: String,
-    dns: DNS,
+    dns: Dns,
     droplet_id: u64,
     floating_ip: FloatingIP,
     interfaces: Interfaces,
@@ -621,7 +621,6 @@ impl Terms {
 
     fn result(&self) -> Vec<String> {
         self.terms.to_owned()
-        // self.terms.iter().map(|s| s.as_str()).collect()
     }
 
     fn new() -> Terms {
@@ -725,7 +724,7 @@ fn mac_sanitise(input: &str) -> String {
              */
             buf.push('0');
         }
-        buf.push_str(&octet);
+        buf.push_str(octet);
 
         buf
     });
@@ -911,7 +910,7 @@ fn ensure_ipv4_gateway(log: &Logger, gateway: &str) -> Result<()> {
 fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str) -> Result<()> {
     info!(log, "ENSURE IPv4 DHCP INTERFACE: {}", n);
 
-    ensure_ipadm_interface(log, &n)?;
+    ensure_ipadm_interface(log, n)?;
 
     let targname = format!("{}/{}", n, sfx);
     info!(log, "target IP name: {}", targname);
@@ -1241,7 +1240,7 @@ fn run_generic(log: &Logger, smbios_uuid: &str) -> Result<()> {
             .arg("-i")
             .arg("-q")
             .arg("-I")
-            .arg(&dev)
+            .arg(dev)
             .current_dir(UNPACKDIR)
             .env_clear()
             .output()?;
@@ -1267,7 +1266,7 @@ fn run_generic(log: &Logger, smbios_uuid: &str) -> Result<()> {
      */
     let name = format!("{}/nodename", UNPACKDIR);
     if let Some(name) = read_file(&name)? {
-        phase_set_hostname(log, &name.trim())?;
+        phase_set_hostname(log, name.trim())?;
     }
 
     /*
@@ -1301,7 +1300,7 @@ fn run_generic(log: &Logger, smbios_uuid: &str) -> Result<()> {
          * Otherwise, use whatever we have:
          */
         if chosen.is_none() {
-            chosen = ifaces.iter().next().map(|x| x.as_str());
+            chosen = ifaces.first().map(|x| x.as_str());
         }
 
         if let Some(chosen) = chosen {
@@ -1359,7 +1358,7 @@ fn run_amazon(log: &Logger) -> Result<()> {
      * Otherwise, use whatever we have:
      */
     if chosen.is_none() {
-        chosen = ifaces.iter().next().map(|x| x.as_str());
+        chosen = ifaces.first().map(|x| x.as_str());
     }
 
     if let Some(chosen) = chosen {
@@ -1508,7 +1507,7 @@ fn run_smartos(log: &Logger) -> Result<()> {
 
                 let sfx = format!("ip{}", i);
 
-                if let Err(e) = ensure_ipv4_interface(log, &sfx, &nic.mac, &ip)
+                if let Err(e) = ensure_ipv4_interface(log, &sfx, &nic.mac, ip)
                 {
                     error!(log, "IFACE {}/{} ERROR: {}", nic.interface, sfx, e);
                 }
@@ -1777,7 +1776,7 @@ fn phase_add_swap(log: &Logger) -> Result<()> {
     let mut vfstab = read_lines("/etc/vfstab")?.unwrap();
     let mut found = false;
     for l in &vfstab {
-        let t: Vec<_> = l.trim().split_whitespace().collect();
+        let t: Vec<_> = l.split_whitespace().collect();
         if t.len() < 7 {
             continue;
         }
@@ -2015,7 +2014,7 @@ mod test {
     #[test]
     fn config_defaults() -> Result<()> {
         let input = "\n";
-        let c: Config = toml::from_str(&input)?;
+        let c: Config = toml::from_str(input)?;
         assert!(!c.network.skip);
         Ok(())
     }
@@ -2023,7 +2022,7 @@ mod test {
     #[test]
     fn config_skip_network() -> Result<()> {
         let input = "[network]\nskip = true\n";
-        let c: Config = toml::from_str(&input)?;
+        let c: Config = toml::from_str(input)?;
         assert!(c.network.skip);
         Ok(())
     }
