@@ -126,7 +126,7 @@ pub fn run(log: &Logger) -> Result<()> {
     if let Mdata::Found(resolvers) = mdata_get(log, "sdc:resolvers")? {
         let resolvers: Vec<String> = serde_json::from_str(&resolvers)?;
 
-        phase_dns(log, &resolvers)?;
+        phase_dns(log, &resolvers, &[])?;
     }
 
     /*

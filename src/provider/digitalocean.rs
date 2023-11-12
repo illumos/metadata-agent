@@ -32,19 +32,7 @@ struct IPv4 {
 impl IPv4 {
     fn prefix_len(&self) -> Result<u32> {
         let nm: Ipv4Addr = self.netmask.parse()?;
-        let bits: u32 = nm.into();
-
-        if bits.leading_zeros() != 0 {
-            bail!("bits not left packed in {}", self.netmask);
-        }
-
-        let len = bits.count_ones();
-        if bits.trailing_zeros() != 32 - len {
-            bail!("bits not contiguous in {}", self.netmask);
-        }
-        assert_eq!(32 - len, bits.trailing_zeros());
-
-        Ok(len)
+        netmask_to_prefix_len(nm)
     }
 
     fn cidr(&self) -> Result<String> {
@@ -119,7 +107,7 @@ pub fn run(log: &Logger) -> Result<()> {
 
         ensure_dir(log, MOUNTPOINT)?;
 
-        let dev = if let Some(dev) = crate::find_device("hsfs")? {
+        let dev = if let Some(dev) = find_device("hsfs", None)? {
             dev
         } else {
             bail!("no hsfs file system found");
@@ -236,7 +224,7 @@ pub fn run(log: &Logger) -> Result<()> {
         }
     }
 
-    phase_dns(log, &md.dns.nameservers)?;
+    phase_dns(log, &md.dns.nameservers, &[])?;
     phase_pubkeys(log, md.public_keys.as_slice())?;
 
     /*
@@ -254,5 +242,5 @@ pub fn run(log: &Logger) -> Result<()> {
 }
 
 pub fn hsfs_probe() -> Result<bool> {
-    Ok(crate::find_device("hsfs")?.is_some())
+    Ok(find_device("hsfs", None)?.is_some())
 }

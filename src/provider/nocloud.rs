@@ -1,0 +1,589 @@
+use std::{
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use anyhow::{anyhow, bail, Result};
+use serde::Deserialize;
+
+use super::prelude::*;
+
+pub fn probe(_log: &Logger) -> Result<bool> {
+    Ok(find_device("pcfs", Some("cidata"))?.is_some())
+}
+
+pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
+    /*
+     * Load our stamp file to see if the Guest UUID has changed.
+     */
+    if let Some([id]) = read_lines(STAMP)?.as_deref() {
+        if id.trim() == smbios_uuid {
+            info!(
+                log,
+                "this guest has already completed first \
+                boot processing, halting"
+            );
+            return Ok(());
+        } else {
+            info!(
+                log,
+                "guest UUID changed ({} -> {}), reprocessing",
+                id.trim(),
+                smbios_uuid
+            );
+        }
+    }
+
+    phase_reguid_zpool(log)?;
+
+    /*
+     * Check to see if the metadata file system is already mounted.
+     */
+    let mounts = mounts()?;
+    let mdmp: Vec<_> =
+        mounts.iter().filter(|m| m.mount_point == MOUNTPOINT).collect();
+
+    let do_mount = match mdmp.as_slice() {
+        [] => true,
+        [m] => {
+            /*
+             * Check the existing mount to see if it is adequate.
+             */
+            if m.fstype != "pcfs" {
+                bail!("INVALID MOUNTED FILE SYSTEM: {:#?}", m);
+            }
+            false
+        }
+        m => {
+            bail!("found these mounts for {}: {:#?}", MOUNTPOINT, m);
+        }
+    };
+
+    if do_mount {
+        ensure_dir(log, MOUNTPOINT)?;
+
+        /*
+         * NoCloud metadata can appear on a device with a pcfs file system, with
+         * the "cidata" volume label.
+         */
+        info!(log, "searching for pcfs device with NoCloud metadata...");
+        let dev = if let Some(dev) = find_device("pcfs", Some("cidata"))? {
+            dev
+        } else {
+            bail!("no pcfs file system found");
+        };
+
+        let output = Command::new(MOUNT)
+            .env_clear()
+            .arg("-F")
+            .arg("pcfs")
+            .arg("-o")
+            .arg("ro")
+            .arg(dev)
+            .arg(MOUNTPOINT)
+            .output()?;
+
+        if !output.status.success() {
+            bail!("mount: {}", output.info());
+        }
+
+        info!(log, "mount ok at {}", MOUNTPOINT);
+    }
+
+    /*
+     * There are potentially several files in the device that interest us.  The
+     * first is a file with network configuration.
+     */
+    let mp = PathBuf::from(MOUNTPOINT);
+    let nc = match load_nc(&mp.join("network-config")) {
+        Ok(Some(nc)) => {
+            info!(log, "loaded network-config from nocloud volume");
+            Some(nc)
+        }
+        Ok(None) => {
+            info!(log, "network-config not found in nocloud volume");
+            None
+        }
+        Err(e) => {
+            error!(log, "network-config load failed: {e}");
+            None
+        }
+    };
+
+    if let Some(nc) = nc {
+        for i in nc.interfaces(log)? {
+            let nic = mac_to_nic(&i.mac)?
+                .ok_or_else(|| anyhow!("MAC address {} not found", i.mac))?;
+
+            match i.addr {
+                InterfaceAddress::Static { addr, prefix } => {
+                    if let Err(e) = ensure_ipv4_interface(
+                        log,
+                        &i.name,
+                        &i.mac,
+                        &format!("{addr}/{prefix}"),
+                    ) {
+                        error!(log, "IFACE ERROR: {e}");
+                    };
+                }
+                InterfaceAddress::Dhcp => {
+                    if let Err(e) =
+                        ensure_ipv4_interface_dhcp(log, &i.name, &nic)
+                    {
+                        error!(log, "DHCP IFACE ERROR: {e}");
+                    }
+                }
+            }
+        }
+
+        for gw in nc.gateways()? {
+            ensure_ipv4_gateway(log, &gw.to_string())?;
+        }
+
+        phase_dns(
+            log,
+            /*
+             * XXX really we should deal in IPv4 addresses across the board, not
+             * strings; alas:
+             */
+            &nc.resolvers()?
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            &nc.domains()?,
+        )?;
+    }
+
+    /*
+     * The second file of interest is the user-data file, which we will
+     * treat as a user script for now.  In future we should also deal with
+     * the #cloud-config format.
+     */
+    let udf = mp.join("user-data");
+    let ud = load_ud(&udf)?;
+
+    if let Some(ud) = ud.as_deref() {
+        phase_userscript(log, ud)
+            .map_err(|e| error!(log, "failed to get user-script: {}", e))
+            .ok();
+    }
+
+    write_lines(log, STAMP, &[smbios_uuid])?;
+
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Interface {
+    name: String,
+    mac: String,
+    addr: InterfaceAddress,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InterfaceAddress {
+    Static { addr: Ipv4Addr, prefix: u32 },
+    Dhcp,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NetworkConfig {
+    V1(Network1),
+}
+
+impl NetworkConfig {
+    fn interfaces(&self, log: &Logger) -> Result<Vec<Interface>> {
+        match self {
+            NetworkConfig::V1(nc) => {
+                let cfgs = nc
+                    .config
+                    .iter()
+                    .filter(|c| {
+                        /*
+                         * Look for physical interfaces where a MAC address has
+                         * been specified.  Without a MAC address we cannot
+                         * match this configuration to an interface on the
+                         * system.
+                         */
+                        c.type_ == "physical" && c.mac_address.is_some()
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut out: Vec<Interface> = Default::default();
+                let mut v4c = 0;
+                for c in cfgs {
+                    for s in c.subnets.iter() {
+                        match s.type_.as_str() {
+                            "dhcp" | "dhcp4" => {
+                                if s.netmask.is_some()
+                                    || s.address.is_some()
+                                    || !s.dns_nameservers.is_empty()
+                                    || !s.dns_search.is_empty()
+                                {
+                                    warn!(
+                                        log,
+                                        "ignoring overrides for DHCP \
+                                        interface {:?}",
+                                        c.name,
+                                    );
+                                }
+
+                                let mac = c.mac_address.as_deref().unwrap();
+
+                                out.push(Interface {
+                                    name: "dhcp".to_string(),
+                                    mac: mac.to_string(),
+                                    addr: InterfaceAddress::Dhcp,
+                                });
+                            }
+                            "static" => {
+                                let nmp = s
+                                    .netmask
+                                    .as_deref()
+                                    .map(|v| v.parse::<Ipv4Addr>())
+                                    .transpose()?
+                                    .and_then(|nm| {
+                                        netmask_to_prefix_len(nm).ok()
+                                    });
+
+                                let Some(addr) = s.address.as_deref() else {
+                                    warn!(
+                                        log,
+                                        "ignoring static interface {:?} \
+                                        with no address",
+                                        c.name
+                                    );
+                                    continue;
+                                };
+
+                                let (addr, p) = if let Some((a, p)) =
+                                    addr.split_once('/')
+                                {
+                                    (
+                                        a.parse::<Ipv4Addr>()?,
+                                        Some(p.parse::<u32>()?),
+                                    )
+                                } else {
+                                    (addr.parse::<Ipv4Addr>()?, None)
+                                };
+
+                                let prefix = if let Some((a, b)) = p.zip(nmp) {
+                                    if a != b {
+                                        bail!(
+                                            "both netmask and prefix \
+                                            length provided, but {a} != {b}"
+                                        );
+                                    }
+                                    a
+                                } else {
+                                    p.or(nmp).unwrap()
+                                };
+
+                                out.push(Interface {
+                                    name: if v4c == 0 {
+                                        "v4".into()
+                                    } else {
+                                        format!("v4n{v4c}")
+                                    },
+                                    mac: c
+                                        .mac_address
+                                        .as_deref()
+                                        .unwrap()
+                                        .to_string(),
+                                    addr: InterfaceAddress::Static {
+                                        addr,
+                                        prefix,
+                                    },
+                                });
+                                v4c += 1;
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+
+                Ok(out)
+            }
+        }
+    }
+
+    fn resolvers(&self) -> Result<Vec<Ipv4Addr>> {
+        match self {
+            NetworkConfig::V1(nc) => Ok(nc
+                .config
+                .iter()
+                .flat_map(|c| {
+                    c.subnets.iter().map(|s| s.dns_nameservers.clone())
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|ns| Ok(ns.parse::<Ipv4Addr>()?))
+                .collect::<Result<Vec<_>>>()?),
+        }
+    }
+
+    fn domains(&self) -> Result<Vec<String>> {
+        match self {
+            NetworkConfig::V1(nc) => Ok(nc
+                .config
+                .iter()
+                .flat_map(|c| c.subnets.iter().map(|s| s.dns_search.clone()))
+                .flatten()
+                .collect::<Vec<_>>()),
+        }
+    }
+
+    fn gateways(&self) -> Result<Vec<Ipv4Addr>> {
+        match self {
+            NetworkConfig::V1(nc) => Ok(nc
+                .config
+                .iter()
+                .flat_map(|c| {
+                    c.subnets.iter().filter_map(|s| s.gateway.as_deref())
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|ns| Ok(ns.parse::<Ipv4Addr>()?))
+                .collect::<Result<Vec<_>>>()?),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Network1 {
+    version: u32,
+    #[serde(default)]
+    config: Vec<Config1>,
+}
+
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Config1 {
+    #[serde(rename = "type")]
+    type_: String,
+    name: String,
+    mac_address: Option<String>,
+    mtu: Option<u32>,
+    #[serde(default)]
+    subnets: Vec<Subnet1>,
+}
+
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Subnet1 {
+    #[serde(rename = "type")]
+    type_: String,
+    address: Option<String>,
+    netmask: Option<String>,
+    gateway: Option<String>,
+    #[serde(default)]
+    dns_nameservers: Vec<String>,
+    #[serde(default)]
+    dns_search: Vec<String>,
+}
+
+fn load_ud(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => bail!("reading {path:?}: {e}"),
+    }
+}
+
+fn load_nc(path: &Path) -> Result<Option<NetworkConfig>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => {
+            if s.is_empty() {
+                /*
+                 * At least propolis-standalone, if not also other hypervisors,
+                 * provides an empty file (rather than eliding the file) if no
+                 * network-config was configured.
+                 */
+                return Ok(None);
+            }
+
+            Ok(Some(parse_nc(&s)?))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => bail!("reading {path:?}: {e}"),
+    }
+}
+
+fn parse_nc(input: &str) -> Result<NetworkConfig> {
+    match serde_yaml::from_str::<Network1>(input) {
+        Ok(nc) => {
+            /*
+             * If the version is not 1, we need to try a different parser even
+             * if this one nominally appeared to succeed.
+             */
+            if nc.version == 1 {
+                for c in &nc.config {
+                    if c.type_ != "physical" {
+                        bail!("unsupported network config type {:?}", c.type_);
+                    }
+
+                    for s in &c.subnets {
+                        match s.type_.as_str() {
+                            "dhcp" | "dhcp4" => (),
+                            "static" => {
+                                if let Some(a) = &s.address {
+                                    if !a.contains('/') && s.netmask.is_none() {
+                                        bail!(
+                                            "must provide either a netmask \
+                                            or a prefix length"
+                                        );
+                                    }
+                                } else {
+                                    bail!("static subnet without address");
+                                }
+                            }
+                            other => bail!("unsupported subnet type {other:?}"),
+                        }
+                    }
+                }
+
+                return Ok(NetworkConfig::V1(nc));
+            }
+        }
+        Err(e) => {
+            bail!("parsing network config as V1: {e}");
+        }
+    }
+
+    bail!("unrecognised network config");
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn netconf0() -> (String, NetworkConfig, Vec<Interface>) {
+        let input = format!(
+            "{}\n",
+            [
+                "version: 1",
+                "config:",
+                "  # Simple network adapter",
+                "  - type: physical",
+                "    name: interface0",
+                "    mac_address: 00:11:22:33:44:55",
+                "    subnets:",
+                "      - type: static",
+                "        address: 10.10.10.100/24",
+                "        gateway: 10.10.10.1",
+                "        dns_nameservers:",
+                "          - 8.8.8.8",
+                "          - 8.8.4.4",
+                "        dns_search:",
+                "          - example.com",
+                "  # Second nic with Jumbo frames",
+                "  - type: physical",
+                "    name: jumbo0",
+                "    mac_address: aa:11:22:33:44:55",
+                "    subnets:",
+                "      - type: dhcp",
+                "    mtu: 9000",
+                "  # 10G pair",
+                "  - type: physical",
+                "    name: gbe0",
+                "    mac_address: cd:11:22:33:44:00",
+                "  - type: physical",
+                "    name: gbe1",
+                "    mac_address: cd:11:22:33:44:02",
+            ]
+            .join("\n")
+        );
+
+        let output = NetworkConfig::V1(Network1 {
+            version: 1,
+            config: vec![
+                Config1 {
+                    type_: "physical".into(),
+                    name: "interface0".into(),
+                    mac_address: Some("00:11:22:33:44:55".into()),
+                    mtu: None,
+                    subnets: vec![Subnet1 {
+                        type_: "static".into(),
+                        address: Some("10.10.10.100/24".into()),
+                        netmask: None,
+                        gateway: Some("10.10.10.1".into()),
+                        dns_nameservers: vec![
+                            "8.8.8.8".into(),
+                            "8.8.4.4".into(),
+                        ],
+                        dns_search: vec!["example.com".into()],
+                    }],
+                },
+                Config1 {
+                    type_: "physical".into(),
+                    name: "jumbo0".into(),
+                    mac_address: Some("aa:11:22:33:44:55".into()),
+                    mtu: Some(9000),
+                    subnets: vec![Subnet1 {
+                        type_: "dhcp".into(),
+                        address: None,
+                        netmask: None,
+                        gateway: None,
+                        dns_nameservers: Default::default(),
+                        dns_search: Default::default(),
+                    }],
+                },
+                Config1 {
+                    type_: "physical".into(),
+                    name: "gbe0".into(),
+                    mac_address: Some("cd:11:22:33:44:00".into()),
+                    mtu: None,
+                    subnets: Default::default(),
+                },
+                Config1 {
+                    type_: "physical".into(),
+                    name: "gbe1".into(),
+                    mac_address: Some("cd:11:22:33:44:02".into()),
+                    mtu: None,
+                    subnets: Default::default(),
+                },
+            ],
+        });
+
+        let interfaces: Vec<Interface> = vec![
+            Interface {
+                name: "v4".into(),
+                mac: "00:11:22:33:44:55".into(),
+                addr: InterfaceAddress::Static {
+                    addr: "10.10.10.100".parse().unwrap(),
+                    prefix: 24,
+                },
+            },
+            Interface {
+                name: "dhcp".into(),
+                mac: "aa:11:22:33:44:55".into(),
+                addr: InterfaceAddress::Dhcp,
+            },
+        ];
+
+        (input, output, interfaces)
+    }
+
+    #[test]
+    fn parse_netconf0() -> Result<()> {
+        let (input, output, _) = netconf0();
+        let nc = parse_nc(&input)?;
+        println!("{nc:#?}");
+        assert_eq!(output, nc);
+        Ok(())
+    }
+
+    #[test]
+    fn make_abstract_interfaces_netconf0() -> Result<()> {
+        let log = crate::common::init_log();
+        let (input, _, interfaces) = netconf0();
+        let nc = parse_nc(&input)?;
+        let got = nc.interfaces(&log)?;
+        println!("{got:#?}");
+        assert_eq!(interfaces, got);
+        Ok(())
+    }
+}

@@ -305,7 +305,45 @@ fn exists_file(p: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn find_device(fstyp: &str) -> Result<Option<String>> {
+fn parse_fstyp_attrs(lines: &str) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+
+    for l in lines.lines() {
+        if l.starts_with(' ') {
+            /*
+             * Ignore nested properties.
+             */
+            continue;
+        }
+
+        if let Some((k, v)) = l.split_once(": ") {
+            let v = v.strip_prefix('\'').and_then(|v| v.strip_suffix('\''));
+
+            if let Some(v) = v {
+                out.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/**
+ * Fetch string-valued top-level attributes from the output of "fstyp -a".
+ * Values other than string-valued attributes are ignored.
+ */
+fn fstyp_attrs(path: &Path) -> Result<HashMap<String, String>> {
+    let output =
+        Command::new(FSTYP).env_clear().arg("-a").arg(path).output()?;
+
+    if !output.status.success() {
+        bail!("fstyp -a {path:?}: {}", output.info());
+    }
+
+    parse_fstyp_attrs(&String::from_utf8(output.stdout)?)
+}
+
+fn find_device(fstyp: &str, volname: Option<&str>) -> Result<Option<String>> {
     let i = std::fs::read_dir("/dev/dsk")?;
 
     let mut out = Vec::new();
@@ -331,11 +369,32 @@ fn find_device(fstyp: &str) -> Result<Option<String>> {
             continue;
         }
 
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            if s.trim() == fstyp {
-                out.push(ent.path());
+        if !String::from_utf8(output.stdout)
+            .ok()
+            .map(|v| v.trim() == fstyp)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        if let Some(want) = volname {
+            /*
+             * Check the volume name to make sure it matches the probe request:
+             */
+            let Ok(pr) = fstyp_attrs(&ent.path()) else {
+                continue;
+            };
+
+            let Some(have) = pr.get("volume_label") else {
+                continue;
+            };
+
+            if have.trim() != want {
+                continue;
             }
         }
+
+        out.push(ent.path());
     }
 
     match out.len() {
@@ -343,6 +402,21 @@ fn find_device(fstyp: &str) -> Result<Option<String>> {
         1 => Ok(Some(out[0].to_str().unwrap().to_string())),
         n => bail!("found {} {fstyp} file systems", n),
     }
+}
+
+fn netmask_to_prefix_len(nm: Ipv4Addr) -> Result<u32> {
+    let bits: u32 = nm.into();
+    if bits.leading_zeros() != 0 {
+        bail!("bits not left packed in {}", nm);
+    }
+
+    let len = bits.count_ones();
+    if bits.trailing_zeros() != 32 - len {
+        bail!("bits not contiguous in {}", nm);
+    }
+    assert_eq!(32 - len, bits.trailing_zeros());
+
+    Ok(len)
 }
 
 struct Terms {
@@ -928,6 +1002,17 @@ fn run(log: &Logger) -> Result<()> {
     }
 
     /*
+     * If that doesn't work, we'll try looking for a "NoCloud" pcfs volume, as
+     * used by cloud-init:
+     */
+    info!(log, "looking for pcfs NoCloud devices...");
+    if provider::nocloud::probe(log)? {
+        info!(log, "hypervisor type: Generic with NoCloud (probed pcfs)");
+        provider::nocloud::run(log, &uuid)?;
+        return Ok(());
+    }
+
+    /*
      * If that doesn't work, we'll try to locate a hsfs image from Digital
      * Ocean.  In future we could more generically look for cloud-init metadata.
      */
@@ -1113,7 +1198,11 @@ fn phase_set_hostname(log: &Logger, hostname: &str) -> Result<()> {
     Ok(())
 }
 
-fn phase_dns(log: &Logger, nameservers: &[String]) -> Result<()> {
+fn phase_dns(
+    log: &Logger,
+    nameservers: &[String],
+    domains: &[String],
+) -> Result<()> {
     /*
      * DNS Servers:
      */
@@ -1127,7 +1216,16 @@ fn phase_dns(log: &Logger, nameservers: &[String]) -> Result<()> {
     for ns in nameservers.iter() {
         let l = format!("nameserver {}", ns);
         if !lines.contains(&l) {
-            info!(log, "ADD DNS CONFIG LINE: {}", l);
+            info!(log, "ADD DNS CONFIG NAMESERVER LINE: {}", l);
+            file.push(l);
+            dirty = true;
+        }
+    }
+
+    for dom in domains.iter() {
+        let l = format!("search {}", dom);
+        if !lines.contains(&l) {
+            info!(log, "ADD DNS CONFIG SEARCH LINE: {}", l);
             file.push(l);
             dirty = true;
         }
@@ -1139,7 +1237,14 @@ fn phase_dns(log: &Logger, nameservers: &[String]) -> Result<()> {
             && ll[0] == "nameserver"
             && !nameservers.contains(&ll[1].to_string())
         {
-            info!(log, "REMOVE DNS CONFIG LINE: {}", l);
+            info!(log, "REMOVE DNS CONFIG NAMESERVER LINE: {}", l);
+            file.push(format!("#{}", l));
+            dirty = true;
+        } else if ll.len() == 2
+            && ll[0] == "search"
+            && !domains.contains(&ll[1].to_string())
+        {
+            info!(log, "REMOVE DNS CONFIG SEARCH LINE: {}", l);
             file.push(format!("#{}", l));
             dirty = true;
         } else {
@@ -1232,6 +1337,8 @@ fn phase_userscript(log: &Logger, userscript: &str) -> Result<()> {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+
     use super::Config;
     use anyhow::Result;
 
@@ -1248,6 +1355,57 @@ mod test {
         let input = "[network]\nskip = true\n";
         let c: Config = toml::from_str(input)?;
         assert!(c.network.skip);
+        Ok(())
+    }
+
+    #[test]
+    fn fstyp_attrs() -> Result<()> {
+        let input = format!(
+            "{}\n",
+            [
+                "pcfs",
+                "bytes_per_sector: 512",
+                "sectors_per_cluster: 1",
+                "reserved_sectors: 1",
+                "fats: 2",
+                "root_entry_count: 512",
+                "total_sectors_16: 42",
+                "media: 248",
+                "fat_size_16: 1",
+                "sectors_per_track: 42",
+                "heads: 64",
+                "hidden_sectors: 0",
+                "total_sectors_32: 0",
+                "drive_number: 0",
+                "volume_id: 305419896",
+                "volume_label: 'cidata     '",
+                "total_sectors: 42",
+                "fat_size: 1",
+                "count_of_clusters: 7",
+                "fat_entry_size: 12",
+                "gen_clean: true",
+                "gen_guid: '12345678'",
+                "gen_version: '12'",
+                "gen_volume_label: 'cidata     '",
+                "a_test_list:",
+                "    something[0]: 'blah'",
+                "    something[1]: 'blah'",
+                "lastprop: '12'",
+            ]
+            .join("\n")
+        );
+        let want: HashMap<String, String> = [
+            ("lastprop".into(), "12".into()),
+            ("gen_volume_label".into(), "cidata     ".into()),
+            ("gen_version".into(), "12".into()),
+            ("volume_label".into(), "cidata     ".into()),
+            ("gen_guid".into(), "12345678".into()),
+        ]
+        .into_iter()
+        .collect();
+        let out = super::parse_fstyp_attrs(&input)?;
+        println!("{out:#?}");
+        assert_eq!(want, out);
         Ok(())
     }
 }
