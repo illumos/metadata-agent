@@ -42,6 +42,7 @@ const SVCADM: &str = "/usr/sbin/svcadm";
 const SWAPADD: &str = "/sbin/swapadd";
 const ZFS: &str = "/sbin/zfs";
 const CPIO: &str = "/usr/bin/cpio";
+const ROUTE: &str = "/sbin/route";
 
 const FMRI_USERSCRIPT: &str = "svc:/system/illumos/userscript:default";
 
@@ -568,6 +569,42 @@ fn dladm_ether_list() -> Result<Vec<String>> {
 
     let ents = parse_net_adm(output.stdout)?;
     Ok(ents.iter().map(|l| l[0].trim().to_string()).collect())
+}
+
+fn nic_to_mac(nic: &str) -> Result<String> {
+    let output = Command::new(DLADM)
+        .env_clear()
+        .arg("show-phys")
+        .arg("-m")
+        .arg("-p")
+        .arg("-o")
+        .arg("slot,address")
+        .arg(nic)
+        .output()?;
+
+    if !output.status.success() {
+        bail!("dladm failed: {}", output.info());
+    }
+
+    let mut primary = None;
+
+    let ents = parse_net_adm(output.stdout)?;
+    for ent in ents.iter() {
+        if ent[0] != "primary" {
+            continue;
+        }
+
+        if primary.is_some() {
+            bail!("NIC {nic} has more than one primary MAC address");
+        }
+        primary = Some(mac_sanitise(&ent[1]));
+    }
+
+    if let Some(mac) = primary {
+        Ok(mac)
+    } else {
+        bail!("could not find primary MAC address for NIC {nic}");
+    }
 }
 
 fn mac_to_nic(mac: &str) -> Result<Option<String>> {

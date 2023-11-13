@@ -106,6 +106,12 @@ pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
      */
     if let Some([id]) = read_lines(STAMP)?.as_deref() {
         if id.trim() == instance_id {
+            /*
+             * We may need to work around the off-network gateway issue each
+             * boot, even if this is not a new instance:
+             */
+            workaround_offnet_gateway(log)?;
+
             info!(
                 log,
                 "this guest has already completed first \
@@ -194,7 +200,39 @@ pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
                 .collect::<Vec<_>>(),
             &nc.domains()?,
         )?;
+    } else {
+        /*
+         * If there is no provided network configuration, just try to set up
+         * DHCP on the first NIC we find.
+         */
+        let ifaces = dladm_ether_list()?;
+        let mut chosen = None;
+        info!(log, "found these ethernet interfaces: {:?}", ifaces);
+        /*
+         * Prefer Virtio devices:
+         */
+        for iface in ifaces.iter() {
+            if iface.starts_with("vioif") {
+                chosen = Some(iface.as_str());
+                break;
+            }
+        }
+        /*
+         * Otherwise, use whatever we have:
+         */
+        if chosen.is_none() {
+            chosen = ifaces.first().map(|x| x.as_str());
+        }
+
+        if let Some(chosen) = chosen {
+            info!(log, "chose interface {}", chosen);
+            ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
+        } else {
+            warn!(log, "could not find an appropriate Ethernet interface!");
+        }
     }
+
+    workaround_offnet_gateway(log)?;
 
     /*
      * The last file of interest is the user-data file, which we will
@@ -211,6 +249,80 @@ pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
     }
 
     write_lines(log, STAMP, &[instance_id])?;
+
+    Ok(())
+}
+
+fn workaround_offnet_gateway(log: &Logger) -> Result<()> {
+    /*
+     * First, check to see if we have obtained a single DHCP address.
+     */
+    let list = ipadm_address_list()?;
+    let addr = list
+        .iter()
+        .filter(|a| a.type_ == "dhcp" && a.state == "ok")
+        .collect::<Vec<_>>();
+
+    let (nic, addr) = match addr.as_slice() {
+        [] => return Ok(()),
+        [a] => (a.name.split('/').next().unwrap().to_string(), a.cidr.clone()),
+        other => bail!("too many DHCP interfaces: {other:?}"),
+    };
+
+    /*
+     * Check to see if the address is for a /32 subnet, which means all
+     * addresses (including the gateway address) are off-network:
+     */
+    let Some((addr, pfx)) = addr.split_once('/') else {
+        return Ok(());
+    };
+    if pfx != "32" {
+        return Ok(());
+    }
+
+    /*
+     * Get the MAC address of the NIC so that we can check the vendor prefix:
+     */
+    let mac = nic_to_mac(&nic)?;
+    if !mac.to_ascii_lowercase().starts_with("a8:40:25:") {
+        /*
+         * Ignore non-Oxide MAC OUI prefixes for now.
+         */
+        return Ok(());
+    }
+
+    /*
+     * What was the gateway address we got from DHCP?
+     */
+    let Some(gw) = dhcpinfo(log, "Router")? else {
+        return Ok(());
+    };
+
+    info!(log, "attempting to work around off-network gateway {gw}...");
+
+    /*
+     * Attempt to add an interface route for the gateway address:
+     */
+    let out = Command::new(ROUTE)
+        .arg("add")
+        .arg("-iface")
+        .arg(format!("{gw}/32"))
+        .arg(addr)
+        .output()?;
+
+    if !out.status.success() {
+        warn!(log, "could not add gateway iface route: {}", out.info());
+    }
+
+    /*
+     * The off-network gateway should now be reachable, so we can add the
+     * default route:
+     */
+    let out = Command::new(ROUTE).arg("add").arg("default").arg(gw).output()?;
+
+    if !out.status.success() {
+        warn!(log, "could not add default gateway route: {}", out.info());
+    }
 
     Ok(())
 }
