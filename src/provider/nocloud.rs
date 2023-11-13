@@ -15,29 +15,9 @@ pub fn probe(_log: &Logger) -> Result<bool> {
 
 pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
     /*
-     * Load our stamp file to see if the Guest UUID has changed.
-     */
-    if let Some([id]) = read_lines(STAMP)?.as_deref() {
-        if id.trim() == smbios_uuid {
-            info!(
-                log,
-                "this guest has already completed first \
-                boot processing, halting"
-            );
-            return Ok(());
-        } else {
-            info!(
-                log,
-                "guest UUID changed ({} -> {}), reprocessing",
-                id.trim(),
-                smbios_uuid
-            );
-        }
-    }
-
-    phase_reguid_zpool(log)?;
-
-    /*
+     * We need to mount the metadata volume before doing anything else, as it be
+     * what provides us with the instance ID on this system.
+     *
      * Check to see if the metadata file system is already mounted.
      */
     let mounts = mounts()?;
@@ -93,9 +73,70 @@ pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
 
     /*
      * There are potentially several files in the device that interest us.  The
-     * first is a file with network configuration.
+     * first is a file with per-instance metadata:
      */
     let mp = PathBuf::from(MOUNTPOINT);
+    let md = match load_md(&mp.join("meta-data")) {
+        Ok(Some(nc)) => {
+            info!(log, "loaded meta-data from nocloud volume");
+            Some(nc)
+        }
+        Ok(None) => {
+            info!(log, "meta-data not found in nocloud volume");
+            None
+        }
+        Err(e) => {
+            error!(log, "meta-data load failed: {e}");
+            None
+        }
+    };
+
+    /*
+     * The per-instance metadata may contain an instance ID that we can use to
+     * identify this instance.  If not, fall back on whatever we gleaned from
+     * SMBIOS (if anything!).
+     */
+    let instance_id = md
+        .as_ref()
+        .and_then(|md| md.instance_id.as_deref())
+        .unwrap_or(smbios_uuid);
+
+    /*
+     * Load our stamp file to see if the Guest UUID has changed.
+     */
+    if let Some([id]) = read_lines(STAMP)?.as_deref() {
+        if id.trim() == instance_id {
+            info!(
+                log,
+                "this guest has already completed first \
+                boot processing, halting"
+            );
+            return Ok(());
+        } else {
+            info!(
+                log,
+                "guest UUID changed ({} -> {}), reprocessing",
+                id.trim(),
+                instance_id,
+            );
+        }
+    }
+
+    phase_reguid_zpool(log)?;
+
+    /*
+     * Set the hostname and SSH keys if provided in the instance metadata:
+     */
+    if let Some(md) = &md {
+        if let Some(name) = md.local_hostname.as_deref() {
+            phase_set_hostname(log, name)?;
+        }
+        phase_pubkeys(log, &md.public_keys.as_slice())?;
+    }
+
+    /*
+     * Next, process the network configuration:
+     */
     let nc = match load_nc(&mp.join("network-config")) {
         Ok(Some(nc)) => {
             info!(log, "loaded network-config from nocloud volume");
@@ -156,7 +197,7 @@ pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
     }
 
     /*
-     * The second file of interest is the user-data file, which we will
+     * The last file of interest is the user-data file, which we will
      * treat as a user script for now.  In future we should also deal with
      * the #cloud-config format.
      */
@@ -169,7 +210,7 @@ pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
             .ok();
     }
 
-    write_lines(log, STAMP, &[smbios_uuid])?;
+    write_lines(log, STAMP, &[instance_id])?;
 
     Ok(())
 }
@@ -456,9 +497,76 @@ fn parse_nc(input: &str) -> Result<NetworkConfig> {
     bail!("unrecognised network config");
 }
 
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct MetaData {
+    instance_id: Option<String>,
+    local_hostname: Option<String>,
+    #[serde(default)]
+    public_keys: Vec<String>,
+}
+
+fn load_md(path: &Path) -> Result<Option<MetaData>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => {
+            if s.is_empty() {
+                /*
+                 * At least propolis-standalone, if not also other hypervisors,
+                 * provides an empty file (rather than eliding the file) if no
+                 * meta-data was configured.
+                 */
+                return Ok(None);
+            }
+
+            Ok(Some(parse_md(&s)?))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => bail!("reading {path:?}: {e}"),
+    }
+}
+
+fn parse_md(input: &str) -> Result<MetaData> {
+    Ok(serde_json::from_str::<MetaData>(input)?)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn metadata0() -> (String, MetaData) {
+        let input = format!(
+            "{}\n",
+            [
+                "{\"instance-id\":\"ef245128-ed25-4dcd-9c47-94a1a439709b\",",
+                "\"local-hostname\":\"helios-test\",",
+                "\"public-keys\":[\"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABg",
+                "nAYCRfaSW8n7JS5QAL9Uc1keTbGtsJjqoAEPxvc7a",
+                "crpDmo+rMeoc+yDLPWLOSZPwfbDcIMftiyB/dxtYT",
+                "JVLW0cwz0c9iYfGbNwztvObptcpHXI6hIpILOSUZF",
+                "lA5kM45U4+AK+Tz0iFY045ycL373Ev0WqjBPyUUdE",
+                "ZUtJ/rXAmLA5oxcfGQ8bPiFQVN8ncPeqBMxNkeihB",
+                "vaJJ6dmg20YblsRAPgJNJhtmGngC4g6be5IHfuThj",
+                "oSCBkp1bol/vXI6wDHcyLE= user@unixsystem\\n\"]}",
+            ]
+            .join("")
+        );
+
+        let output = MetaData {
+            instance_id: Some("ef245128-ed25-4dcd-9c47-94a1a439709b".into()),
+            local_hostname: Some("helios-test".into()),
+            public_keys: vec!["ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABg\
+                nAYCRfaSW8n7JS5QAL9Uc1keTbGtsJjqoAEPxvc7a\
+                crpDmo+rMeoc+yDLPWLOSZPwfbDcIMftiyB/dxtYT\
+                JVLW0cwz0c9iYfGbNwztvObptcpHXI6hIpILOSUZF\
+                lA5kM45U4+AK+Tz0iFY045ycL373Ev0WqjBPyUUdE\
+                ZUtJ/rXAmLA5oxcfGQ8bPiFQVN8ncPeqBMxNkeihB\
+                vaJJ6dmg20YblsRAPgJNJhtmGngC4g6be5IHfuThj\
+                oSCBkp1bol/vXI6wDHcyLE= user@unixsystem\n"
+                .into()],
+        };
+
+        (input, output)
+    }
 
     fn netconf0() -> (String, NetworkConfig, Vec<Interface>) {
         let input = format!(
@@ -584,6 +692,15 @@ mod test {
         let got = nc.interfaces(&log)?;
         println!("{got:#?}");
         assert_eq!(interfaces, got);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_basic_metadata() -> Result<()> {
+        let (input, output) = metadata0();
+        let got = parse_md(&input)?;
+        println!("{got:#?}");
+        assert_eq!(output, got);
         Ok(())
     }
 }
