@@ -2,6 +2,7 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use anyhow::{anyhow, bail, Result};
@@ -9,11 +10,37 @@ use serde::Deserialize;
 
 use super::prelude::*;
 
-pub fn probe(_log: &Logger) -> Result<bool> {
-    Ok(find_device("pcfs", Some("cidata"))?.is_some())
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Flavour {
+    Generic,
+    Oxide,
 }
 
-pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
+pub fn probe(log: &Logger) -> Option<Flavour> {
+    if let Some(dev) = find_device("pcfs", Some("cidata")).ok().flatten() {
+        info!(log, "pcfs metadata device found: {dev:?}");
+
+        for nic in dladm_ether_list().unwrap_or_default() {
+            if let Ok(mac) = nic_to_mac(&nic) {
+                if mac.to_ascii_lowercase().starts_with("a8:40:25:") {
+                    /*
+                     * If the guest has been provided with a MAC address using
+                     * the Oxide OUI, it is likely an Oxide Rack VM even though
+                     * we didn't get the SMBIOS data we were expecting to see.
+                     */
+                    info!(log, "Oxide MAC address detected ({mac})");
+                    return Some(Flavour::Oxide);
+                }
+            }
+        }
+
+        Some(Flavour::Generic)
+    } else {
+        None
+    }
+}
+
+pub fn run(log: &Logger, smbios_uuid: &str, flav: Flavour) -> Result<()> {
     /*
      * We need to mount the metadata volume before doing anything else, as it be
      * what provides us with the instance ID on this system.
@@ -110,7 +137,7 @@ pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
              * We may need to work around the off-network gateway issue each
              * boot, even if this is not a new instance:
              */
-            workaround_offnet_gateway(log)?;
+            workaround_offnet_gateway(log, flav)?;
 
             info!(
                 log,
@@ -232,7 +259,7 @@ pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
         }
     }
 
-    workaround_offnet_gateway(log)?;
+    workaround_offnet_gateway(log, flav)?;
 
     /*
      * The last file of interest is the user-data file, which we will
@@ -253,20 +280,44 @@ pub fn run(log: &Logger, smbios_uuid: &str) -> Result<()> {
     Ok(())
 }
 
-fn workaround_offnet_gateway(log: &Logger) -> Result<()> {
-    /*
-     * First, check to see if we have obtained a single DHCP address.
-     */
-    let list = ipadm_address_list()?;
-    let addr = list
-        .iter()
-        .filter(|a| a.type_ == "dhcp" && a.state == "ok")
-        .collect::<Vec<_>>();
+fn workaround_offnet_gateway(log: &Logger, flav: Flavour) -> Result<()> {
+    if flav != Flavour::Oxide {
+        return Ok(());
+    }
 
-    let (nic, addr) = match addr.as_slice() {
-        [] => return Ok(()),
-        [a] => (a.name.split('/').next().unwrap().to_string(), a.cidr.clone()),
-        other => bail!("too many DHCP interfaces: {other:?}"),
+    /*
+     * If this is not first boot, the DHCP address may have been configured
+     * persistently on a previous boot.  That means it will come up
+     * automatically, but it might not have come up by the time we check here.
+     * Wait for DHCP to settle before we proceed:
+     */
+    let mut complained = false;
+    let addr = loop {
+        let list = ipadm_address_list()?;
+        let addr = list
+            .iter()
+            .filter(|a| a.type_ == "dhcp" && a.state == "ok")
+            .collect::<Vec<_>>();
+
+        match addr.as_slice() {
+            [] => {
+                if !complained {
+                    complained = true;
+                    info!(log, "waiting for DHCP to settle...");
+                }
+
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            [a] => {
+                if complained {
+                    info!(log, "DHCP address now available: {a:?}");
+                }
+
+                break a.cidr.clone();
+            }
+            other => bail!("too many DHCP interfaces: {other:?}"),
+        };
     };
 
     /*
@@ -277,17 +328,6 @@ fn workaround_offnet_gateway(log: &Logger) -> Result<()> {
         return Ok(());
     };
     if pfx != "32" {
-        return Ok(());
-    }
-
-    /*
-     * Get the MAC address of the NIC so that we can check the vendor prefix:
-     */
-    let mac = nic_to_mac(&nic)?;
-    if !mac.to_ascii_lowercase().starts_with("a8:40:25:") {
-        /*
-         * Ignore non-Oxide MAC OUI prefixes for now.
-         */
         return Ok(());
     }
 

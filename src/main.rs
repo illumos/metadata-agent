@@ -213,6 +213,7 @@ struct ConfigNetwork {
 #[derive(Debug)]
 enum MountOptionValue {
     Present,
+    #[allow(unused)]
     Value(String),
 }
 
@@ -966,6 +967,15 @@ fn run(log: &Logger) -> Result<()> {
         info!(log, "SMBIOS information: {:?}", smbios);
 
         match (smbios.manufacturer.as_str(), smbios.product.as_str()) {
+            ("Oxide", "OxVM") => {
+                info!(log, "hypervisor type: Oxide Rack (from SMBIOS)");
+                provider::nocloud::run(
+                    log,
+                    &smbios.uuid,
+                    provider::nocloud::Flavour::Oxide,
+                )?;
+                return Ok(());
+            }
             ("Joyent", "SmartDC HVM") => {
                 info!(log, "hypervisor type: SmartOS (from SMBIOS)");
                 provider::smartos::run(log)?;
@@ -1043,9 +1053,9 @@ fn run(log: &Logger) -> Result<()> {
      * used by cloud-init:
      */
     info!(log, "looking for pcfs NoCloud devices...");
-    if provider::nocloud::probe(log)? {
-        info!(log, "hypervisor type: Generic with NoCloud (probed pcfs)");
-        provider::nocloud::run(log, &uuid)?;
+    if let Some(flav) = provider::nocloud::probe(log) {
+        info!(log, "hypervisor type: {flav:?} with NoCloud (probed pcfs)");
+        provider::nocloud::run(log, &uuid, flav)?;
         return Ok(());
     }
 
