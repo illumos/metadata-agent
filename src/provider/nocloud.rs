@@ -119,6 +119,26 @@ pub fn run(log: &Logger, smbios_uuid: &str, flav: Flavour) -> Result<()> {
     };
 
     /*
+     * Next, process the network configuration:
+     */
+    let nc = match load_nc(&mp.join("network-config")) {
+        Ok(Some(nc)) => {
+            info!(log, "loaded network-config from nocloud volume");
+            Some(nc)
+        }
+        Ok(None) => {
+            info!(log, "network-config not found in nocloud volume");
+            None
+        }
+        Err(e) => {
+            error!(log, "network-config load failed: {e}");
+            None
+        }
+    };
+
+    let uses_dhcp = nc.as_ref().map(|nc| nc.uses_dhcp()).unwrap_or(true);
+
+    /*
      * The per-instance metadata may contain an instance ID that we can use to
      * identify this instance.  If not, fall back on whatever we gleaned from
      * SMBIOS (if anything!).
@@ -137,7 +157,9 @@ pub fn run(log: &Logger, smbios_uuid: &str, flav: Flavour) -> Result<()> {
              * We may need to work around the off-network gateway issue each
              * boot, even if this is not a new instance:
              */
-            workaround_offnet_gateway(log, flav)?;
+            if uses_dhcp {
+                workaround_offnet_gateway(log, flav)?;
+            }
 
             info!(
                 log,
@@ -166,24 +188,6 @@ pub fn run(log: &Logger, smbios_uuid: &str, flav: Flavour) -> Result<()> {
         }
         phase_pubkeys(log, &md.public_keys.as_slice())?;
     }
-
-    /*
-     * Next, process the network configuration:
-     */
-    let nc = match load_nc(&mp.join("network-config")) {
-        Ok(Some(nc)) => {
-            info!(log, "loaded network-config from nocloud volume");
-            Some(nc)
-        }
-        Ok(None) => {
-            info!(log, "network-config not found in nocloud volume");
-            None
-        }
-        Err(e) => {
-            error!(log, "network-config load failed: {e}");
-            None
-        }
-    };
 
     if let Some(nc) = nc {
         for i in nc.interfaces(log)? {
@@ -259,7 +263,9 @@ pub fn run(log: &Logger, smbios_uuid: &str, flav: Flavour) -> Result<()> {
         }
     }
 
-    workaround_offnet_gateway(log, flav)?;
+    if uses_dhcp {
+        workaround_offnet_gateway(log, flav)?;
+    }
 
     /*
      * The last file of interest is the user-data file, which we will
@@ -284,6 +290,8 @@ fn workaround_offnet_gateway(log: &Logger, flav: Flavour) -> Result<()> {
     if flav != Flavour::Oxide {
         return Ok(());
     }
+
+    info!(log, "checking if workaround for off-net gateway is required...");
 
     /*
      * If this is not first boot, the DHCP address may have been configured
@@ -540,6 +548,20 @@ impl NetworkConfig {
                 .into_iter()
                 .map(|ns| Ok(ns.parse::<Ipv4Addr>()?))
                 .collect::<Result<Vec<_>>>()?),
+        }
+    }
+
+    /**
+     * Assess whether this configuration specifies any DHCP interfaces or not.
+     */
+    fn uses_dhcp(&self) -> bool {
+        match self {
+            NetworkConfig::V1(nc) => {
+                nc.config.iter().any(|c| match c.type_.as_str() {
+                    "dhcp" | "dhcp4" => true,
+                    _ => false,
+                })
+            }
         }
     }
 }
