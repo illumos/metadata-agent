@@ -85,12 +85,12 @@ pub fn run(log: &Logger) -> Result<()> {
         chosen = ifaces.first().map(|x| x.as_str());
     }
 
-    if let Some(chosen) = chosen {
-        info!(log, "chose interface {}", chosen);
-        ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
-    } else {
+    let Some(chosen) = chosen else {
         bail!("could not find an appropriate Ethernet interface!");
-    }
+    };
+
+    info!(log, "chose interface {}", chosen);
+    ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
 
     /*
      * Determine the instance ID, using the metadata service:
@@ -117,7 +117,7 @@ pub fn run(log: &Logger) -> Result<()> {
                 log,
                 "guest Instance ID changed ({} -> {}), reprocessing",
                 id.trim(),
-                instid
+                instid,
             );
         }
     }
@@ -127,13 +127,14 @@ pub fn run(log: &Logger) -> Result<()> {
     /*
      * Determine the node name for this guest:
      */
-    let (src, n) = if let Some(hostname) = dhcpinfo(log, "hostname")? {
-        ("DHCP", hostname.trim().to_string())
-    } else if let Some(hostname) = amazon_metadata_get(log, "hostname")? {
-        ("metadata", hostname.trim().to_string())
-    } else {
-        bail!("could not get hostname for this VM");
-    };
+    let (src, n) =
+        if let Some(hostname) = dhcpinfo(log, "hostname", Some(chosen))? {
+            ("DHCP", hostname.trim().to_string())
+        } else if let Some(hostname) = amazon_metadata_get(log, "hostname")? {
+            ("metadata", hostname.trim().to_string())
+        } else {
+            bail!("could not get hostname for this VM");
+        };
     info!(log, "VM node name is \"{}\" (from {})", n, src);
     phase_set_hostname(log, &n)?;
 

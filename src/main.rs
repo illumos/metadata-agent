@@ -66,9 +66,21 @@ fn smf_enable(log: &Logger, fmri: &str) -> Result<()> {
     Ok(())
 }
 
-fn dhcpinfo(log: &Logger, key: &str) -> Result<Option<String>> {
-    info!(log, "exec: dhcpinfo {}", key);
-    let output = Command::new(DHCPINFO).env_clear().arg(key).output()?;
+fn dhcpinfo(
+    log: &Logger,
+    key: &str,
+    iface: Option<&str>,
+) -> Result<Option<String>> {
+    info!(log, "exec: dhcpinfo {}", key; "interface" => ?iface);
+
+    let mut cmd = Command::new(DHCPINFO);
+    cmd.env_clear();
+
+    if let Some(iface) = iface {
+        cmd.arg("-i").arg(iface);
+    }
+
+    let output = cmd.arg(key).output()?;
 
     if !output.status.success() {
         bail!("dhcpinfo {} failed: {}", key, output.info());
@@ -502,6 +514,12 @@ struct IpadmAddress {
     type_: String,
     state: String,
     cidr: String,
+}
+
+impl IpadmAddress {
+    fn interface(&self) -> Option<String> {
+        self.name.split_once('/').map(|(ifname, _)| ifname.to_string())
+    }
 }
 
 fn ipadm_address_list() -> Result<Vec<IpadmAddress>> {

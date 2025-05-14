@@ -301,30 +301,29 @@ fn workaround_offnet_gateway(log: &Logger, flav: Flavour) -> Result<()> {
      */
     let mut complained = false;
     let addr = loop {
-        let list = ipadm_address_list()?;
-        let addr = list
-            .iter()
+        let addr = ipadm_address_list()?
+            .into_iter()
             .filter(|a| a.type_ == "dhcp" && a.state == "ok")
-            .collect::<Vec<_>>();
+            /*
+             * If there is more than one DHCP address, we will just use the
+             * first one, as this is presumably the primary interface which
+             * should have the default gateway route configured.
+             */
+            .next();
 
-        match addr.as_slice() {
-            [] => {
-                if !complained {
-                    complained = true;
-                    info!(log, "waiting for DHCP to settle...");
-                }
-
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
+        if let Some(addr) = addr {
+            if complained {
+                info!(log, "DHCP address now available: {addr:?}");
             }
-            [a] => {
-                if complained {
-                    info!(log, "DHCP address now available: {a:?}");
-                }
 
-                break a.cidr.clone();
+            break addr;
+        } else {
+            if !complained {
+                complained = true;
+                info!(log, "waiting for DHCP to settle...");
             }
-            other => bail!("too many DHCP interfaces: {other:?}"),
+
+            std::thread::sleep(Duration::from_millis(250));
         };
     };
 
@@ -332,7 +331,7 @@ fn workaround_offnet_gateway(log: &Logger, flav: Flavour) -> Result<()> {
      * Check to see if the address is for a /32 subnet, which means all
      * addresses (including the gateway address) are off-network:
      */
-    let Some((addr, pfx)) = addr.split_once('/') else {
+    let Some((ip, pfx)) = addr.cidr.split_once('/') else {
         return Ok(());
     };
     if pfx != "32" {
@@ -342,7 +341,8 @@ fn workaround_offnet_gateway(log: &Logger, flav: Flavour) -> Result<()> {
     /*
      * What was the gateway address we got from DHCP?
      */
-    let Some(gw) = dhcpinfo(log, "Router")? else {
+    let Some(gw) = dhcpinfo(log, "Router", Some(&addr.interface().unwrap()))?
+    else {
         return Ok(());
     };
 
@@ -355,7 +355,7 @@ fn workaround_offnet_gateway(log: &Logger, flav: Flavour) -> Result<()> {
         .arg("add")
         .arg("-iface")
         .arg(format!("{gw}/32"))
-        .arg(addr)
+        .arg(ip)
         .output()?;
 
     if !out.status.success() {
