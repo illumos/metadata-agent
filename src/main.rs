@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 Oxide Computer Company
+ * Copyright 2025 Oxide Computer Company
  */
 
 #![allow(unused_imports)]
@@ -795,20 +795,25 @@ fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str) -> Result<()> {
     info!(log, "ADDRESSES: {:?}", &addrs);
 
     let mut name_found = false;
-    let mut address_found = false;
+    let mut wrong_type = false;
     for addr in &addrs {
-        if addr.name == targname {
-            info!(log, "ipadm address with name exists: {:?}", addr);
-            name_found = true;
+        if addr.name != targname {
+            continue;
         }
-        if addr.type_ == "dhcp" {
-            info!(log, "ipadm DHCP address exists: {:?}", addr);
-            address_found = true;
+
+        info!(log, "ipadm address with name exists: {:?}", addr);
+        name_found = true;
+
+        if addr.type_ != "dhcp" {
+            wrong_type = true;
         }
+
+        break;
     }
 
-    if name_found && !address_found {
-        info!(log, "ipadm address exists but with wrong IP address, deleting");
+    let mut recreate = false;
+    if name_found && wrong_type {
+        info!(log, "ipadm address exists but with wrong type, deleting");
         let output = Command::new(IPADM)
             .env_clear()
             .arg("delete-addr")
@@ -818,9 +823,11 @@ fn ensure_ipv4_interface_dhcp(log: &Logger, sfx: &str, n: &str) -> Result<()> {
         if !output.status.success() {
             bail!("ipadm delete-addr {}: {}", &targname, output.info());
         }
+
+        recreate = true;
     }
 
-    if !address_found {
+    if !name_found || recreate {
         info!(log, "ipadm DHCP address NEEDS CREATION");
         let output = Command::new(IPADM)
             .env_clear()

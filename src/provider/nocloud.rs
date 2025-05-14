@@ -1,4 +1,9 @@
+/*
+ * Copyright 2025 Oxide Computer Company
+ */
+
 use std::{
+    collections::HashSet,
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process::Command,
@@ -234,31 +239,46 @@ pub fn run(log: &Logger, smbios_uuid: &str, flav: Flavour) -> Result<()> {
     } else {
         /*
          * If there is no provided network configuration, just try to set up
-         * DHCP on the first NIC we find.
+         * DHCP on any interfaces we find.
          */
         let ifaces = dladm_ether_list()?;
-        let mut chosen = None;
         info!(log, "found these ethernet interfaces: {:?}", ifaces);
+
         /*
-         * Prefer Virtio devices:
+         * Keep configuring interfaces until we get them all:
          */
-        for iface in ifaces.iter() {
-            if iface.starts_with("vioif") {
-                chosen = Some(iface.as_str());
-                break;
+        let mut done: HashSet<&str> = HashSet::new();
+        loop {
+            /*
+             * Prefer Virtio devices:
+             */
+            let mut chosen = ifaces
+                .iter()
+                .map(|x| x.as_str())
+                .filter(|x| !done.contains(x) && x.starts_with("vioif"))
+                .next();
+
+            /*
+             * Otherwise, use whatever we have:
+             */
+            if chosen.is_none() {
+                chosen = ifaces
+                    .iter()
+                    .map(|x| x.as_str())
+                    .filter(|x| !done.contains(x))
+                    .next();
             }
-        }
-        /*
-         * Otherwise, use whatever we have:
-         */
-        if chosen.is_none() {
-            chosen = ifaces.first().map(|x| x.as_str());
+
+            let Some(chosen) = chosen else {
+                break;
+            };
+
+            done.insert(chosen);
+            info!(log, "chose interface #{} {}", done.len(), chosen);
+            ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
         }
 
-        if let Some(chosen) = chosen {
-            info!(log, "chose interface {}", chosen);
-            ensure_ipv4_interface_dhcp(log, "dhcp", chosen)?;
-        } else {
+        if done.is_empty() {
             warn!(log, "could not find an appropriate Ethernet interface!");
         }
     }
